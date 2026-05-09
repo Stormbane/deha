@@ -1,0 +1,27 @@
+{
+  "type": "micro",
+  "wake_word": "Okay Nabu",
+  "author": "Kevin Ahrendt",
+  "website": "https://www.kevinahrendt.com/",
+  "model": "okay_nabu.tflite",
+  "trained_languages": ["en"],
+  "version": 2,
+  "micro": {
+    "probability_cutoff": 0.56,
+    "feature_step_size": 10,
+    "sliding_window_size": 5,
+    "tensor_arena_size": 90000,
+    "minimum_esphome_version": "2024.7.0"
+  },
+  "_notes": [
+    "Local copy of okay_nabu — upstream manifest has tensor_arena_size: 26080,",
+    "which is not enough for our build of esp-tflite-micro 1.3.3 on ESP32-S3.",
+    "TFLite's AllocateTensors fragments the arena and a 19472-byte intermediate",
+    "buffer can't fit. Tried 60000 — failed with byte-identical numbers. Now at",
+    "90000 (next probe step). If still fragmenting, the bound is internal-RAM",
+    "supply, not arena size, and we need to free more DRAM (e.g. drop API SSL",
+    "or shrink mbedtls). probability_cutoff also pre-set to voice-pe's",
+    "'slightly sensitive' value (0.56) so we don't override at YAML level.",
+    "See docs/research/mww-silent-failure-2026-05-01.md."
+  ]
+}

@@ -1,0 +1,2672 @@
+esphome:
+  name: narada
+  friendly_name: "Narada"
+  min_version: 2026.3.0
+  on_boot:
+    # Cycle 2.22 — allocate the live-frame-push buffer in PSRAM and
+    # spawn the TCP listener task on port 6060. Defaults: mode OFF,
+    # so the native display lambda runs unchanged until cognition
+    # calls set_remote_frame_mode(true).
+    priority: -100
+    then:
+      - lambda: |-
+          static const size_t FRAME_BYTES = 320 * 240 * 2;
+          id(remote_frame_buffer) = (uint8_t*)heap_caps_malloc(
+              FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (id(remote_frame_buffer) == nullptr) {
+            ESP_LOGW("frame", "PSRAM alloc failed, trying internal heap");
+            id(remote_frame_buffer) = (uint8_t*)heap_caps_malloc(
+                FRAME_BYTES, MALLOC_CAP_8BIT);
+          }
+          if (id(remote_frame_buffer) == nullptr) {
+            ESP_LOGE("frame", "framebuffer alloc failed (need %u bytes)",
+                     (unsigned)FRAME_BYTES);
+            return;
+          }
+          memset(id(remote_frame_buffer), 0, FRAME_BYTES);
+          ESP_LOGI("frame", "framebuffer ready at %p (%u bytes)",
+                   id(remote_frame_buffer), (unsigned)FRAME_BYTES);
+
+          xTaskCreate([](void*) {
+            static const size_t FB_BYTES = 320 * 240 * 2;
+            int srv = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (srv < 0) {
+              ESP_LOGE("frame", "socket() failed");
+              vTaskDelete(nullptr);
+              return;
+            }
+            int one = 1;
+            ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            struct sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(6060);
+            addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (::bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+              ESP_LOGE("frame", "bind(:6060) failed");
+              ::close(srv);
+              vTaskDelete(nullptr);
+              return;
+            }
+            if (::listen(srv, 1) < 0) {
+              ESP_LOGE("frame", "listen() failed");
+              ::close(srv);
+              vTaskDelete(nullptr);
+              return;
+            }
+            ESP_LOGI("frame", "TCP listener up on :6060");
+            while (true) {
+              struct sockaddr_in cli_addr;
+              socklen_t cli_len = sizeof(cli_addr);
+              int cli = ::accept(srv, (struct sockaddr*)&cli_addr, &cli_len);
+              if (cli < 0) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+              }
+              if (id(remote_frame_buffer) == nullptr) {
+                ::close(cli);
+                continue;
+              }
+              size_t total = 0;
+              uint32_t deadline = millis() + 5000;
+              while (total < FB_BYTES && (int32_t)(deadline - millis()) > 0) {
+                int n = ::recv(cli, id(remote_frame_buffer) + total,
+                               FB_BYTES - total, 0);
+                if (n > 0) {
+                  total += (size_t)n;
+                } else if (n == 0) {
+                  break;
+                } else {
+                  break;
+                }
+              }
+              ::close(cli);
+              if (total == FB_BYTES) {
+                ESP_LOGD("frame", "frame received");
+              } else {
+                ESP_LOGW("frame", "short frame: %u/%u bytes",
+                         (unsigned)total, (unsigned)FB_BYTES);
+              }
+            }
+          }, "fb_rx", 4096, nullptr, 1, nullptr);
+
+          // Audio (mic + speaker) is handled by ESPHome's voice_assistant
+          // component now — see the voice_assistant: block below. The earlier
+          // bespoke TCP audio paths on :6061 and :6062 were removed once the
+          // canonical ESPHome flow proved end-to-end on 2026-04-29.
+
+      # mww start is now driven by voice_assistant via the
+      # `micro_wake_word: mww` linkage — VA manages mww lifecycle
+      # automatically. No need for an explicit start action here.
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    # esp-idf is required for voice_assistant + micro_wake_word. The earlier
+    # arduino framework lacked the heap headroom for the wake-word tensor
+    # arena ("Failed to allocate tensors" on 2026.3.3 + arduino).
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+
+# Cycle 2.22 — enable PSRAM so the live-frame-push buffer (153,600 bytes)
+# can sit outside internal SRAM. ESP32-S3-BOX-3 has octal PSRAM @ 80MHz.
+psram:
+  mode: octal
+  speed: 80MHz
+
+# =====================================================================
+# AUDIO BLOCK — canonical ESPHome BOX-3 voice path (proved 2026-04-29).
+# The whole audio stack (i2c bus, i2s_audio, es7210 ADC, es8311 DAC, mic,
+# speaker, GPIO46 PA enable, voice_assistant, micro_wake_word) is grouped
+# so it can be lifted as a standalone reference firmware. See
+# narada-voice-test.yaml for the standalone form.
+#
+# Hardware: ESP32-S3-BOX-3. Dual mics → ES7210 ADC on I²C bus, fed into
+# I²S0. ES8311 DAC drives a small speaker through a PA chip gated by
+# GPIO46. Pins: BCLK=17, LRCK=45, MCLK=2, mic DIN=16, spk DOUT=15.
+# =====================================================================
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+audio_adc:
+  - platform: es7210
+    id: es7210_adc
+    bits_per_sample: 16bit
+    mic_gain: 37.5dB
+    sample_rate: 16000
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 48000  # canonical HA Voice-PE rate; mic stays at 16kHz
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_dac
+    # Phase B canonical: 100ms buffer matched to the audio component's
+    # decoder→resampler→I2S writer pipeline. The 2000ms ring was a
+    # workaround for direct PCM streaming through send_voice_assistant_audio
+    # under CPU contention; with media_player URL playback the audio
+    # component manages its own internal PSRAM buffering (much larger
+    # than 100ms) and the speaker ring just feeds the I2S DMA.
+    buffer_duration: 100ms
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    i2s_din_pin: GPIO16
+    adc_type: external
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+# Phase B: media_player wraps box_speaker, providing the proper TTS
+# announcement pipeline (decoder → resampler → mixer → I2S writer).
+# voice_assistant references this media_player rather than the raw
+# speaker, so the bridge can return a URL in TTS_END and the device
+# fetches + decodes + plays through the canonical audio path.
+http_request:
+  id: http_client
+  timeout: 5s
+  watchdog_timeout: 10s
+
+media_player:
+  - platform: speaker
+    id: speaker_media_player
+    name: Narada Speaker
+    volume_min: 0.5
+    volume_max: 0.9
+    announcement_pipeline:
+      speaker: box_speaker
+      format: MP3       # bridge serves edge-tts MP3 directly
+      sample_rate: 48000
+      num_channels: 1   # BOX-3 has a single output channel
+
+# Phase B voice_assistant: references media_player instead of speaker.
+# Mic stays at 16kHz (Whisper's native rate); TTS playback flows
+# through the media_player URL fetcher.
+voice_assistant:
+  id: va
+  microphone: box_mic
+  media_player: speaker_media_player
+  micro_wake_word: mww
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  on_client_connected:
+    # Canonical HA pattern (wake-word-voice-assistants/esp32-s3-box-3):
+    # set_use_wake_word(false) tells voice_assistant to YIELD wake-word
+    # duty to micro_wake_word and sit passively until mww calls
+    # voice_assistant.start with a wake_word arg. Without this call,
+    # VA owns the streaming wake-word path and mww never gets audio
+    # frames — which is why VERY_VERBOSE produced zero probability
+    # lines in every previous config. Wrapped in start_wake_word so
+    # on_end / on_client_disconnected can re-use the same handoff.
+    - logger.log: "va: client connected — start_wake_word"
+    - script.execute: start_wake_word
+  on_client_disconnected:
+    - logger.log: "va: client disconnected — stop_wake_word"
+    - script.execute: stop_wake_word
+  on_listening:
+    - lambda: |-
+        id(listening_active) = true;
+        id(alien_activity)   = std::string("listening");
+        id(stt_transcript)   = std::string("");
+        id(va_active)        = true;
+    - script.execute: draw_display
+  on_stt_end:
+    - lambda: |-
+        id(stt_transcript) = x;
+  on_intent_start:
+    - lambda: |-
+        id(alien_activity) = std::string("thinking");
+    - script.execute: draw_display
+  on_tts_start:
+    - lambda: |-
+        id(alien_activity)        = std::string("speaking");
+        id(utterance_text)        = x;
+        id(utterance_total_words) = 0;
+        id(utterance_word_index)  = 0;
+        // Rough word count for karaoke timing.
+        int words = 0;
+        bool in_word = false;
+        for (char c : x) {
+          if (c == ' ' || c == '\n' || c == '\t') {
+            in_word = false;
+          } else if (!in_word) {
+            in_word = true;
+            words++;
+          }
+        }
+        id(utterance_total_words) = words;
+    - script.execute: draw_display
+  on_end:
+    # Phase B: wait for the media_player announcement to fully drain
+    # before handing the mic back to mww — otherwise mww hears its
+    # own tail-end audio and can re-trigger immediately. Mirrors the
+    # canonical HA Voice-PE on_end pattern exactly.
+    - wait_until:
+        - and:
+            - not:
+                media_player.is_announcing:
+            - not:
+                speaker.is_playing:
+    - lambda: |-
+        id(listening_active)      = false;
+        id(alien_activity)        = std::string("resting");
+        id(stt_transcript)        = std::string("");
+        id(utterance_text)        = std::string("");
+        id(utterance_total_words) = 0;
+        id(utterance_word_index)  = 0;
+        id(va_active)             = false;
+    - script.execute: draw_display
+    - script.execute: start_wake_word
+  on_error:
+    - lambda: |-
+        ESP_LOGW("va", "error code=%s message=%s",
+                 code.c_str(), message.c_str());
+        id(listening_active) = false;
+        id(alien_activity)   = std::string("resting");
+        id(va_active)        = false;
+    - script.execute: draw_display
+    - script.execute: start_wake_word
+
+# Phase A scripts: wake-word handoff lifted from canonical HA Voice-PE.
+# The pivotal call is set_use_wake_word(false): without it, VA owns
+# the streaming wake-word path and starves mww of audio frames.
+#
+# Phase B+ script: draw_display fires once per state transition. The
+# display has update_interval: never; this script + the idle interval
+# are the only callers of component.update.
+script:
+  - id: start_wake_word
+    then:
+      - if:
+          condition:
+            not:
+              voice_assistant.is_running:
+          then:
+            - lambda: id(va).set_use_wake_word(false);
+            - micro_wake_word.start:
+            - logger.log: "mww: started (use_wake_word=false)"
+  - id: stop_wake_word
+    then:
+      - micro_wake_word.stop:
+      - voice_assistant.stop:
+      - logger.log: "mww: stopped"
+  - id: draw_display
+    then:
+      - component.update: narada_display
+
+# Idle scene animator (see also the `interval:` block further down for
+# the signal-decay tick). Both entries belong to the same top-level
+# `interval:` key, so the idle animator lives inside that block.
+
+# On-device wake word. Pinned to the V1 model URL because ESPHome
+# 2026.3.x has a known regression on ESP32-S3-BOX-3 where the new
+# audio stack fragments PSRAM, leaving no contiguous block for the V2
+# tensor arena. V2 models silently fail to allocate; V1 still works.
+# Bare `model: hey_jarvis` resolves to V2 and breaks here.
+# See https://github.com/esphome/esphome/issues/15603
+micro_wake_word:
+  id: mww
+  microphone: box_mic
+  on_wake_word_detected:
+    - logger.log:
+        format: "wake word detected: %s"
+        args: ['wake_word.c_str()']
+    # Pass the detected wake_word phrase through to voice_assistant
+    # (matches the canonical HA-Voice-PE pattern). This is what makes
+    # voice_pipeline.py's handle_start receive wake_word_phrase="Hey Jarvis"
+    # instead of None — confirms the call came from real wake-word
+    # detection rather than a phantom auto-start.
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+  vad:
+  models:
+    - model: github://esphome/micro-wake-word-models/models/hey_jarvis.json@main
+      id: hey_jarvis_v1
+      # Lower cutoff for diagnosis: with 0.5 default, only high-confidence
+      # detections fire. 0.3 lets us see whether mww IS scoring our voice
+      # but just below threshold. Combined with VERY_VERBOSE logs, this
+      # turn's data should be conclusive.
+      probability_cutoff: 0.3
+
+logger:
+  # INFO is the steady state. Bumped temporarily to VERY_VERBOSE
+  # diagnostic earlier — captured 30s of audio at the right level
+  # and confirmed micro_wake_word emits zero probability lines on
+  # this hardware/version, regardless of config. Pivoted to
+  # software wake word in the bridge (see voice_pipeline.py).
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Narada-Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+ota:
+  - platform: esphome
+
+web_server:
+  port: 80
+
+# ---------------------------------------------------------------------------
+# v1.0 EXPRESSION CONTRACT
+# See embodiment/design/v1.0-architecture.md for the cognition <-> body
+# contract. Cycle 1 (this commit) wires globals + API services + proprioception
+# sensors. The display lambda is unchanged — visual evolution lands in Cycle 2+.
+# ---------------------------------------------------------------------------
+
+api:
+  services:
+    # --- backwards-compat: existing daemon callers (deprecated, remove after Cycle 2) ---
+    - service: set_status
+      variables:
+        message: string
+      then:
+        - lambda: |-
+            id(heartbeat_status_str) = message;
+
+    - service: set_thought
+      variables:
+        message: string
+      then:
+        - lambda: |-
+            id(current_thought_str) = message;
+
+    # --- v1.0 mood layer ---
+    - service: set_mood
+      variables:
+        valence: float
+        arousal: float
+      then:
+        - lambda: |-
+            id(mood_valence) = valence < -1.0f ? -1.0f : (valence > 1.0f ? 1.0f : valence);
+            id(mood_arousal) = arousal < 0.0f ? 0.0f : (arousal > 1.0f ? 1.0f : arousal);
+
+    # --- v1.0 vitality layer ---
+    - service: set_vitality
+      variables:
+        sleep_pressure: float
+        restlessness: float
+        warmth: float
+      then:
+        - lambda: |-
+            id(vitality_sleep_pressure) = sleep_pressure < 0.0f ? 0.0f : (sleep_pressure > 1.0f ? 1.0f : sleep_pressure);
+            id(vitality_restlessness)   = restlessness   < 0.0f ? 0.0f : (restlessness   > 1.0f ? 1.0f : restlessness);
+            id(vitality_warmth)         = warmth         < 0.0f ? 0.0f : (warmth         > 1.0f ? 1.0f : warmth);
+
+    # --- v1.0 attention layer ---
+    - service: set_attention
+      variables:
+        mode: string
+        target: string
+        intensity: float
+      then:
+        - lambda: |-
+            if (mode == std::string("inward") || mode == std::string("outward") || mode == std::string("diffuse")) {
+              id(attention_mode) = mode;
+            } else {
+              id(attention_mode) = std::string("diffuse");
+            }
+            id(attention_target) = target;
+            id(attention_intensity) = intensity < 0.0f ? 0.0f : (intensity > 1.0f ? 1.0f : intensity);
+
+    # --- v1.0 activity layer ---
+    - service: set_activity
+      variables:
+        mode: string
+      then:
+        - lambda: |-
+            // Allowlist activity modes; unknown falls back to resting (the joy-default-aware fallback).
+            if (mode == std::string("resting")   || mode == std::string("thinking") ||
+                mode == std::string("listening") || mode == std::string("speaking") ||
+                mode == std::string("seeing")    || mode == std::string("working")  ||
+                mode == std::string("dreaming")) {
+              id(activity_mode) = mode;
+            } else {
+              id(activity_mode) = std::string("resting");
+            }
+
+    # --- v1.0 utterance layer (karaoke speaking) ---
+    # Note: `text` is reserved by ESPHome — service variable named `phrase` instead.
+    - service: set_utterance
+      variables:
+        phrase: string
+        total_words: int
+      then:
+        - lambda: |-
+            id(utterance_text)        = phrase;
+            id(utterance_total_words) = total_words;
+            id(utterance_word_index)  = 0;
+
+    - service: set_word_index
+      variables:
+        word_index: int
+      then:
+        - lambda: |-
+            id(utterance_word_index) = word_index;
+
+    - service: clear_utterance
+      then:
+        - lambda: |-
+            id(utterance_text)        = std::string("");
+            id(utterance_total_words) = 0;
+            id(utterance_word_index)  = 0;
+
+    # --- v1.0 signal layer ---
+    - service: emit_signal
+      variables:
+        kind: string
+        duration_ms: int
+      then:
+        - lambda: |-
+            // Allowlist signal kinds; unknown is a no-op.
+            if (kind == std::string("none")    || kind == std::string("oh")      ||
+                kind == std::string("q")       || kind == std::string("dots")    ||
+                kind == std::string("check")   || kind == std::string("bang")    ||
+                kind == std::string("ask")     || kind == std::string("noticed") ||
+                kind == std::string("love")) {
+              id(signal_kind) = kind;
+            } else {
+              return;
+            }
+            if (duration_ms == 0) {
+              id(signal_until_ms) = 0;  // persistent — held until clear_signal
+            } else {
+              id(signal_until_ms) = millis() + (uint32_t)duration_ms;
+            }
+
+    - service: clear_signal
+      then:
+        - lambda: |-
+            id(signal_kind)     = std::string("none");
+            id(signal_until_ms) = 0;
+
+    # --- v1.0 visual preferences (the "wardrobe") ---
+    # Toggleable visual style. Cognition picks; firmware renders. Adding
+    # a new species or palette becomes one more case in this service.
+    - service: set_tree_species
+      variables:
+        species: string  # "pine" | "oak" | "mixed"
+      then:
+        - lambda: |-
+            if (species == std::string("pine"))       id(visual_tree_species) = 0;
+            else if (species == std::string("oak"))   id(visual_tree_species) = 1;
+            else if (species == std::string("mixed")) id(visual_tree_species) = 2;
+            // unknown values silently ignored — keeps state stable.
+
+    - service: set_ufo_mode
+      variables:
+        mode: string  # "grey" | "mood" | "outline"
+      then:
+        - lambda: |-
+            if (mode == std::string("grey"))         id(visual_ufo_mode) = 0;
+            else if (mode == std::string("mood"))    id(visual_ufo_mode) = 1;
+            else if (mode == std::string("outline")) id(visual_ufo_mode) = 2;
+
+    # --- v1.0 weather layer (environmental — pushed from cognition) ---
+    # The body lives in Kallangur, QLD. Cognition polls Open-Meteo and
+    # pushes current conditions; the lambda renders weather into the
+    # horizon engine (cloud cover, wind sway on trees, rain streaks).
+    - service: set_weather
+      variables:
+        wind_kmh: float
+        wind_dir: float
+        precip: float
+        cloud_pct: float
+        wcode: int
+        temp_c: float
+      then:
+        - lambda: |-
+            id(weather_wind_speed_kmh) = wind_kmh < 0.0f
+              ? 0.0f
+              : (wind_kmh > 200.0f ? 200.0f : wind_kmh);
+            float wd = wind_dir;
+            while (wd < 0.0f)    wd += 360.0f;
+            while (wd >= 360.0f) wd -= 360.0f;
+            id(weather_wind_direction_deg) = wd;
+            id(weather_precipitation_mm_hr) = precip < 0.0f
+              ? 0.0f
+              : (precip > 100.0f ? 100.0f : precip);
+            id(weather_cloud_cover_pct) = cloud_pct < 0.0f
+              ? 0.0f
+              : (cloud_pct > 100.0f ? 100.0f : cloud_pct);
+            id(weather_code) = wcode;
+            id(weather_temperature_c) = temp_c;
+
+    # --- Cycle 2.22 — live frame push toggle ---
+    # When enabled, the display lambda blits id(remote_frame_buffer)
+    # instead of running the native scene engine. The buffer is filled
+    # by the TCP listener spawned in on_boot.
+    - service: set_remote_frame_mode
+      variables:
+        enabled: bool
+      then:
+        - lambda: |-
+            id(remote_frame_active) = enabled;
+            ESP_LOGI("frame", "remote_frame_active = %d", (int)enabled);
+
+    # --- Cycle 3.1 — bhumi switch ---
+    # Direct world-switch hook. Allowlisted to prevent unknown values.
+    # The sandhi engine (cycle 3.2) will eventually drive this from
+    # activity_mode transitions.
+    - service: set_bhumi
+      variables:
+        name: string
+      then:
+        - lambda: |-
+            if (name == std::string("landscape") ||
+                name == std::string("ufo_interior")) {
+              id(bhumi_current) = name;
+              ESP_LOGI("bhumi", "bhumi_current = %s", name.c_str());
+            } else {
+              ESP_LOGW("bhumi", "unknown bhumi: %s", name.c_str());
+            }
+
+    # --- Cycle 3.2 — alien rig services ---
+    - service: set_alien_activity
+      variables:
+        name: string
+      then:
+        - lambda: |-
+            id(alien_activity) = name;
+            ESP_LOGI("alien", "activity = %s", name.c_str());
+
+    - service: set_alien_mood
+      variables:
+        name: string
+      then:
+        - lambda: |-
+            id(alien_mood) = name;
+            ESP_LOGI("alien", "mood = %s", name.c_str());
+
+    - service: set_alien_speech
+      variables:
+        phrase: string
+      then:
+        - lambda: |-
+            id(alien_speech) = phrase;
+            ESP_LOGI("alien", "speech (%u chars)", (unsigned)phrase.length());
+
+    # --- Cycle 4.1 — voice control ---
+    - service: clear_listening
+      then:
+        - lambda: |-
+            id(listening_active) = false;
+            id(stt_transcript) = "";
+            ESP_LOGI("voice", "listening cleared by desktop bridge");
+
+    - service: set_stt_transcript
+      variables:
+        phrase: string
+      then:
+        - lambda: |-
+            id(stt_transcript) = phrase;
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: "Australia/Brisbane"
+
+# Auto-clear expired transient signals so cognition doesn't have to schedule
+# the clear itself. Persistent signals (duration_ms == 0 → signal_until_ms == 0)
+# are skipped; only `clear_signal` clears those.
+interval:
+  # Phase B+ idle scene animator. Drives the alien rig + sky + clouds
+  # at 500ms only when va_active is false. During voice turns this is
+  # a no-op so the SPI bus and CPU are free for clean I2S audio. The
+  # va lifecycle hooks call draw_display directly to push the static
+  # phase glyph once per transition.
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            lambda: return !id(va_active);
+          then:
+            - component.update: narada_display
+  - interval: 250ms
+    then:
+      - lambda: |-
+          uint32_t until = id(signal_until_ms);
+          if (until > 0 && id(signal_kind) != std::string("none")) {
+            int32_t remaining = (int32_t)(until - millis());
+            if (remaining <= 0) {
+              id(signal_kind)     = std::string("none");
+              id(signal_until_ms) = 0;
+            }
+          }
+
+globals:
+  # --- Cycle 2.22 — live frame push ---
+  - id: remote_frame_active
+    type: bool
+    initial_value: 'false'
+  - id: remote_frame_buffer
+    type: uint8_t*
+    initial_value: 'nullptr'
+
+  # --- Cycle 3.1 — current bhumi (world model). "landscape" or
+  # "ufo_interior". Eventually driven by activity_mode via the sandhi
+  # engine; for now switchable directly via set_bhumi.
+  - id: bhumi_current
+    type: std::string
+    initial_value: '"landscape"'
+
+  # --- Cycle 3.2 — alien rig state ---
+  # When bhumi_current == "ufo_interior", these drive the alien-Narada
+  # composition. alien_activity selects the preset (resting, speaking,
+  # listening, thinking, working, dreaming, walking_left, walking_right,
+  # greeting); alien_mood overlays on eyes/brow/mouth (neutral, happy,
+  # upset, sad, playful); alien_speech is the text shown in the speech
+  # bubble when the activity is "speaking".
+  - id: alien_activity
+    type: std::string
+    initial_value: '"resting"'
+  - id: alien_mood
+    type: std::string
+    initial_value: '"neutral"'
+  - id: alien_speech
+    type: std::string
+    initial_value: '""'
+
+  # --- Voice activity flag — set true while voice_assistant is in any
+  # active state (listening / thinking / speaking). The display lambda
+  # early-returns when this is true, freezing the scene on the last
+  # rendered frame. Visuals hold for the duration of a turn so all
+  # the SPI bandwidth + CPU goes to clean audio I/O. The frozen frame
+  # is fine UX: voice is the active modality during a turn anyway.
+  - id: va_active
+    type: bool
+    initial_value: 'false'
+
+  # --- Cycle 4.1 — voice/listen state ---
+  # Set true by the touchscreen handler when Narada should start
+  # capturing audio. Cleared by the desktop bridge via clear_listening
+  # when the capture window ends (server-side VAD endpoint detection).
+  - id: listening_active
+    type: bool
+    initial_value: 'false'
+  # Partial STT transcript pushed by the desktop bridge as words land.
+  # Rendered as a scrolling band above Narada's head while listening.
+  - id: stt_transcript
+    type: std::string
+    initial_value: '""'
+
+  # --- backwards-compat globals (remove after Cycle 2 once daemon migrates) ---
+  - id: heartbeat_status_str
+    type: std::string
+    initial_value: '"awakening..."'
+  - id: current_thought_str
+    type: std::string
+    initial_value: '"Om Namo Bhagavate Naradaya"'
+
+  # --- v1.0 mood (defaults: gentle positive valence, low arousal) ---
+  - id: mood_valence
+    type: float
+    initial_value: '0.3f'
+  - id: mood_arousal
+    type: float
+    initial_value: '0.4f'
+
+  # --- v1.0 vitality (defaults: rested, calm, warm — joy-default) ---
+  - id: vitality_sleep_pressure
+    type: float
+    initial_value: '0.3f'
+  - id: vitality_restlessness
+    type: float
+    initial_value: '0.2f'
+  - id: vitality_warmth
+    type: float
+    initial_value: '0.6f'
+
+  # --- v1.0 attention (defaults: diffuse, no specific target) ---
+  - id: attention_mode
+    type: std::string
+    initial_value: '"diffuse"'
+  - id: attention_target
+    type: std::string
+    initial_value: '""'
+  - id: attention_intensity
+    type: float
+    initial_value: '0.4f'
+
+  # --- v1.0 activity (default: resting) ---
+  - id: activity_mode
+    type: std::string
+    initial_value: '"resting"'
+
+  # --- v1.0 utterance (default: empty — no spoken sentence active) ---
+  - id: utterance_text
+    type: std::string
+    initial_value: '""'
+  - id: utterance_total_words
+    type: int
+    initial_value: '0'
+  - id: utterance_word_index
+    type: int
+    initial_value: '0'
+
+  # --- v1.0 signal (default: none) ---
+  - id: signal_kind
+    type: std::string
+    initial_value: '"none"'
+  - id: signal_until_ms
+    type: uint32_t
+    initial_value: '0'
+
+  # --- v1.0 weather (defaults: calm and dry) ---
+  - id: weather_wind_speed_kmh
+    type: float
+    initial_value: '0.0f'
+  - id: weather_wind_direction_deg
+    type: float
+    initial_value: '0.0f'
+  - id: weather_precipitation_mm_hr
+    type: float
+    initial_value: '0.0f'
+  - id: weather_cloud_cover_pct
+    type: float
+    initial_value: '0.0f'
+  - id: weather_code
+    type: int
+    initial_value: '0'
+  - id: weather_temperature_c
+    type: float
+    initial_value: '22.0f'
+
+  # --- v1.0 visual preferences (defaults: pine trees, grey filled UFO) ---
+  - id: visual_tree_species
+    type: int
+    initial_value: '0'  # 0=pine, 1=oak, 2=mixed
+  - id: visual_ufo_mode
+    type: int
+    initial_value: '0'  # 0=grey filled, 1=mood-tinted, 2=outline-only
+
+spi:
+  clk_pin: 7
+  mosi_pin: 6
+
+# Cycle 4.1 — touchscreen for Narada's input gesture.
+# ESP32-S3-BOX-3 wires the GT911 capacitive touch controller on I2C
+# pins SDA=8, SCL=18 with INT on GPIO3. The reset line is shared with
+# the display reset on GPIO48, which the display already handles.
+i2c:
+  sda: 8
+  scl: 18
+  scan: false   # don't probe — display reset shares the rst line
+
+touchscreen:
+  - platform: gt911
+    id: narada_touch
+    interrupt_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    display: narada_display
+    on_touch:
+      # Touch on landscape    → sandhi into the UFO cabin.
+      # Touch on ufo_interior → start the voice_assistant (push-to-talk).
+      # The voice_assistant on_listening hook flips alien_activity and
+      # listening_active; we don't have to set them here.
+      - if:
+          condition:
+            lambda: 'return id(bhumi_current) == std::string("landscape");'
+          then:
+            - lambda: |-
+                id(bhumi_current) = "ufo_interior";
+                ESP_LOGI("touch", "sandhi: landscape -> ufo_interior");
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(bhumi_current) == std::string("ufo_interior");'
+                then:
+                  - logger.log: "touch — voice_assistant.start"
+                  - voice_assistant.start:
+
+output:
+  - platform: ledc
+    pin: GPIO47
+    id: backlight_output
+
+# Speaker PA enable on GPIO46. Without this the DAC clocks audio fine
+# but the amp feeding the physical speaker stays off, so the box is
+# silent. RESTORE_DEFAULT_ON keeps it enabled across boots — the small
+# idle hum is tolerable in exchange for not having to gate it manually.
+switch:
+  - platform: gpio
+    name: Speaker Enable
+    id: speaker_enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: "LCD Backlight"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: ili9xxx
+    id: narada_display
+    model: S3BOX
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    invert_colors: false
+    # Event-driven rendering (Phase B+, mirrors HA's canonical config):
+    # the display does not poll. A separate `interval:` block ticks the
+    # idle scene animator at 500ms — and that block is itself gated on
+    # `!va_active`, so during voice turns the display redraws ONLY when
+    # the va lifecycle hooks explicitly fire `draw_display`. Eliminates
+    # the per-frame contention with the I2S audio path that was causing
+    # crackles even with the va_active early-return.
+    update_interval: never
+    lambda: |-
+      // ===================================================================
+      // VOICE-ACTIVE STATIC FRAME — Phase B+ event-driven rendering.
+      // Display redraws ONLY when va lifecycle fires draw_display script;
+      // no millis() animation, no triangle-wave pulse. Each phase is a
+      // single static glyph (one fill + one filled_circle), pushed once
+      // per state transition. SPI bus + CPU sit idle the rest of the
+      // turn, freeing bandwidth for clean I2S audio.
+      //
+      // Phase glyph:
+      // - listening: bright cyan disc, large radius — "open ear"
+      // - thinking:  soft violet disc, mid radius   — "considering"
+      // - speaking:  warm amber disc, large radius  — "voicing"
+      // ===================================================================
+      if (id(va_active)) {
+        it.fill(Color(0x08, 0x0C, 0x18));   // very dark navy
+        Color pulse_col;
+        int radius;
+        std::string act = id(alien_activity);
+        if (act == std::string("listening")) {
+          pulse_col = Color(0x60, 0xC0, 0xF0);   // cyan-blue
+          radius    = 24;
+        } else if (act == std::string("thinking")) {
+          pulse_col = Color(0xC0, 0x90, 0xE0);   // soft violet
+          radius    = 18;
+        } else {                                  // speaking or unknown
+          pulse_col = Color(0xF0, 0xC0, 0x60);   // warm amber
+          radius    = 24;
+        }
+        it.filled_circle(160, 120, radius, pulse_col);
+        return;
+      }
+
+      // ===================================================================
+      // CYCLE 2.22 — live frame push override. When remote_frame_active is
+      // true and the framebuffer is allocated, blit it directly and skip
+      // the native scene engine. Toggle via API service set_remote_frame_mode.
+      // ===================================================================
+      if (id(remote_frame_active) && id(remote_frame_buffer) != nullptr) {
+        const uint8_t *buf = id(remote_frame_buffer);
+        for (int y = 0; y < 240; y++) {
+          for (int x = 0; x < 320; x++) {
+            int i = (y * 320 + x) * 2;
+            uint16_t p = ((uint16_t)buf[i] << 8) | buf[i + 1];
+            uint8_t r = (p >> 8) & 0xF8;
+            uint8_t g = (p >> 3) & 0xFC;
+            uint8_t b = (p << 3) & 0xF8;
+            it.draw_pixel_at(x, y, Color(r, g, b));
+          }
+        }
+        return;
+      }
+
+      // ===================================================================
+      // CYCLE 3.1 — bhumi dispatch. ufo_interior is the inside-the-saucer
+      // view: dark cockpit, porthole onto the sky, alien-Narada with
+      // beating heart + saccading eyes. Switch via set_bhumi service.
+      // ===================================================================
+      if (id(bhumi_current) == std::string("ufo_interior")) {
+        // --- ambient state (pulled from globals; subset of landscape's) ---
+        uint32_t bhumi_now_ms = millis();
+        // Brisbane local time for sky color through the porthole.
+        auto brisbane_now = id(sntp_time).now();
+        float ufo_hour = 12.0f;
+        if (brisbane_now.is_valid()) {
+          ufo_hour = (float)brisbane_now.hour + (float)brisbane_now.minute / 60.0f;
+        }
+        bool ufo_is_day = (ufo_hour >= 6.0f && ufo_hour < 18.0f);
+        float ufo_cloud = id(weather_cloud_cover_pct);
+
+        // Sky color for porthole — same palette as landscape sky.
+        uint8_t psr, psg, psb;
+        if      (ufo_hour >= 4.5f  && ufo_hour < 6.0f)  { psr=0x30; psg=0x18; psb=0x44; }
+        else if (ufo_hour >= 6.0f  && ufo_hour < 7.0f)  { psr=0x60; psg=0x24; psb=0x40; }
+        else if (ufo_hour >= 7.0f  && ufo_hour < 8.0f)  { psr=0x58; psg=0x38; psb=0x40; }
+        else if (ufo_hour >= 8.0f  && ufo_hour < 16.0f) { psr=0x20; psg=0x40; psb=0x70; }
+        else if (ufo_hour >= 16.0f && ufo_hour < 17.0f) { psr=0x40; psg=0x30; psb=0x40; }
+        else if (ufo_hour >= 17.0f && ufo_hour < 18.0f) { psr=0x70; psg=0x28; psb=0x20; }
+        else if (ufo_hour >= 18.0f && ufo_hour < 19.0f) { psr=0x50; psg=0x18; psb=0x30; }
+        else if (ufo_hour >= 19.0f && ufo_hour < 20.0f) { psr=0x28; psg=0x14; psb=0x40; }
+        else                                             { psr=0x08; psg=0x0E; psb=0x18; }
+        Color porthole_sky(psr, psg, psb);
+
+        // ----- Cockpit cabin: large windows on top, floor on bottom -----
+        // Sky fills the upper band as a single backdrop; vertical mullions
+        // overlay it to break the view into three panes (left alien, middle
+        // bubble, right). Below the floor line the cabin floor is opaque.
+        const int floor_y      = 168;     // pixel y where floor begins
+        const int top_frame_h  = 10;      // top cabin frame strip
+        const int sill_h       = 4;       // sill at the floor line
+        const int mull1_col    = 14;      // mullion between left & middle pane
+        const int mull2_col    = 30;      // mullion between middle & right pane
+        const int mull_w_px    = 12;      // mullion thickness in px
+        Color floor_col(0x4A, 0x4E, 0x58);
+        Color frame_col(0x90, 0x96, 0xA0);
+
+        // 1. Sky — fills full width behind everything, clipped by mullions.
+        it.filled_rectangle(0, top_frame_h, 320, floor_y - top_frame_h,
+                            porthole_sky);
+        // 2. Floor — opaque grey from floor_y down.
+        it.filled_rectangle(0, floor_y, 320, 240 - floor_y, floor_col);
+        // 3. Stars in the sky band (night, clear sky).
+        if (!ufo_is_day && ufo_cloud < 50.0f) {
+          uint32_t seed = 0xa11ce5u;
+          for (int i = 0; i < 14; i++) {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            int scol = (int)(seed % 44u);
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            int srow = (int)(seed % 9u);
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            float ph = (float)(seed % 1000u) / 1000.0f * 6.2831853f;
+            int sxp = scol * 7 + 3;
+            int syp = top_frame_h + 6 + srow * 14;
+            if (syp > floor_y - 8) continue;
+            float b = (sinf((float)bhumi_now_ms / 700.0f + ph) + 1.0f) * 0.5f;
+            if (b > 0.65f) {
+              it.print(sxp, syp, id(plex_mono_12),
+                       Color(0xE8, 0xE0, 0xC4), TextAlign::CENTER, "*");
+            }
+          }
+        }
+        // 4. Sun (day) — drifts left→right across the sky band.
+        if (ufo_is_day) {
+          float t_day_u = (ufo_hour - 6.0f) / 12.0f;
+          int sxp = (int)(t_day_u * 320.0f);
+          int syp = (int)(top_frame_h + 16
+                          + (1.0f - sinf(3.14159f * t_day_u)) * 28.0f);
+          if (syp > top_frame_h + 4 && syp < floor_y - 8) {
+            it.filled_circle(sxp, syp, 7, Color(0xF8, 0xD8, 0x70));
+          }
+        }
+        // 5. Frames overlay — top frame, sill, two vertical mullions.
+        it.filled_rectangle(0, 0, 320, top_frame_h, frame_col);
+        it.filled_rectangle(0, floor_y - sill_h, 320, sill_h, frame_col);
+        it.filled_rectangle(mull1_col * 7, top_frame_h,
+                            mull_w_px, floor_y - top_frame_h, frame_col);
+        it.filled_rectangle(mull2_col * 7, top_frame_h,
+                            mull_w_px, floor_y - top_frame_h, frame_col);
+
+        // ----- Mood tint for accents -----
+        float v = (id(mood_valence) + 1.0f) * 0.5f;
+        float a = id(mood_arousal);
+        auto bcomp = [&](float c00, float c10, float c01, float c11) -> uint8_t {
+          float r = (1.0f - v) * (1.0f - a) * c00 + v * (1.0f - a) * c10
+                  + (1.0f - v) * a * c01 + v * a * c11;
+          if (r < 0.0f) r = 0.0f; if (r > 255.0f) r = 255.0f;
+          return (uint8_t)r;
+        };
+        uint8_t tr = bcomp(0x4A, 0xC4, 0xB0, 0x7A);
+        uint8_t tg = bcomp(0x55, 0x96, 0x40, 0x50);
+        uint8_t tb = bcomp(0x60, 0x2A, 0x60, 0x8C);
+        Color accent(
+          (uint8_t)((tr * 1.15f > 255.0f) ? 255 : (int)(tr * 1.15f)),
+          (uint8_t)((tg * 1.15f > 255.0f) ? 255 : (int)(tg * 1.15f)),
+          (uint8_t)((tb * 1.15f > 255.0f) ? 255 : (int)(tb * 1.15f))
+        );
+
+        // ----- Alien rig: resolve layer glyphs for current activity -----
+        // Bright cream so the alien pops against the blue sky behind the
+        // cabin windows.
+        Color skin(0xF0, 0xE8, 0xD0);
+        Color eyes_col(0xF8, 0xF8, 0xE8);
+        const std::string& act = id(alien_activity);
+        const std::string& mood = id(alien_mood);
+
+        // Defaults (matches "resting" preset).
+        const char* antennae = "..-=-..";
+        const char* brow     = "_ _";
+        const char* eyes_g   = "O O";
+        const char* mouth    = "\\_/";
+        const char* ear_l    = "";
+        const char* ear_r    = "";
+        const char* legs     = "/     \\";
+        bool draw_side_O     = true;
+        // Shoulders + hands carry Narada's sacred thread (yajnopavita)
+        // crossing diagonally `/` from right shoulder down across torso.
+        const char* sh_str   = "/|   / |\\";   // shoulders + thread
+        const char* hd_str   = "O |__/__| O";  // hands + thread crossing
+
+        // alien_row=5 puts the legs row (rig row 11) at y=224 with the
+        // glyph extending to y=238 — feet flush with screen bottom.
+        // alien_col=6 when a speech bubble is up so the bubble can occupy
+        // the right ~20 cols without overlapping the face; otherwise 14.
+        bool has_speech = (act == std::string("speaking") && !id(alien_speech).empty());
+        // alien_col=0 → silhouette's leftmost glyph at screen col 1 (1-char pad).
+        int alien_col = has_speech ? 0 : 14;
+        int alien_row = 5;
+        if (act == std::string("walking_right") || act == std::string("walking_left")) {
+          float cycle_t = (float)(bhumi_now_ms % 24000UL) / 24000.0f;
+          int offset = (int)(cycle_t * 20.0f - 10.0f);
+          if (act == std::string("walking_left")) offset = -offset;
+          alien_col += offset;
+          // Walking eyes look in direction of travel.
+          if (act == std::string("walking_right")) eyes_g = "o >";
+          else                                      eyes_g = "< o";
+          // Leg cycle: 2-frame, 300ms per frame.
+          int leg_frame = (int)(bhumi_now_ms / 300UL) & 1;
+          if (leg_frame == 0) {
+            legs = (act == std::string("walking_right")) ? "/\\   / " : " \\   /\\";
+          } else {
+            legs = "/     \\";
+          }
+        }
+
+        // Activity-specific overrides
+        if (act == std::string("speaking")) {
+          eyes_g = "o o";
+          // Viseme cycle: 7 frames, 130ms each.
+          static const char* visemes[7] = {"<u>", "<_u_>", "<O>", "<_>", "<u>", "===", "<u>"};
+          int vi = (int)(bhumi_now_ms / 130UL) % 7;
+          mouth = visemes[vi];
+        } else if (act == std::string("listening")) {
+          antennae = "^^---^^";
+          brow = "^ ^";
+          eyes_g = "o o";
+          mouth = "---";
+          // Listening pulse: 4 frames, 300ms each.
+          static const char* lefts[4]  = {"", "(", "( (", "( ( ("};
+          static const char* rights[4] = {"", ")", ") )", ") ) )"};
+          int wi = (int)(bhumi_now_ms / 300UL) % 4;
+          ear_l = lefts[wi];
+          ear_r = rights[wi];
+        } else if (act == std::string("thinking")) {
+          antennae = "??---??";
+          eyes_g = "o '";
+          mouth = "---";
+        } else if (act == std::string("working")) {
+          eyes_g = ". .";
+          mouth = "___";
+          sh_str = "__|     |__";
+          hd_str = " [_______] ";
+          draw_side_O = false;
+        } else if (act == std::string("dreaming")) {
+          antennae = ",,---,,";
+          brow = "- -";
+          eyes_g = "-----";   // 5-char closed_deep
+          mouth = "~~~";
+        } else if (act == std::string("greeting")) {
+          eyes_g = "o o";
+          // Namaskaram silhouette uses custom rows below.
+        } else if (act == std::string("surprised")) {
+          antennae = "!!---!!";
+          brow = "^ ^";
+          eyes_g = "O O";
+          mouth = " O ";
+        }
+
+        // Mood overlays (only when not speaking — visemes own the mouth)
+        bool mood_active = (act != std::string("speaking"));
+        if (mood_active) {
+          if (mood == std::string("happy")) {
+            brow = "_ _"; eyes_g = "o o"; mouth = "\\_/";
+          } else if (mood == std::string("upset")) {
+            brow = "\\ /"; eyes_g = "A A"; mouth = "/-\\";
+          } else if (mood == std::string("sad")) {
+            brow = "v v"; eyes_g = ". ."; mouth = "/_\\";
+          } else if (mood == std::string("playful")) {
+            eyes_g = "- O"; mouth = "=u=";
+          }
+        }
+
+        // ----- Idle animation: breathing + resting-pace -----
+        // Breath is a 4s vertical bob (±1-2 px) for every non-walking,
+        // non-speech-bubble state — keeps Narada alive even when still.
+        // Resting also drifts left/right ±5 cols on a 30s cycle, so he
+        // paces slowly back and forth across the cabin floor.
+        int breath_dy = 0;
+        if (act != std::string("walking_left") &&
+            act != std::string("walking_right") &&
+            !has_speech) {
+          float br = sinf((float)bhumi_now_ms / 4000.0f * 6.2831853f);
+          breath_dy = (int)(br * 1.8f);
+        }
+        if (act == std::string("resting")) {
+          float pt = (float)(bhumi_now_ms % 30000UL) / 30000.0f;
+          alien_col += (int)(sinf(pt * 6.2831853f) * 5.0f);
+        }
+
+        // ----- Render alien row by row -----
+        const int CW = 7, CH = 14;
+        int ax = alien_col * CW;
+        int ay = alien_row * CH + breath_dy;
+
+        // Body fills — per-region rectangles that hug the inside of the
+        // ASCII silhouette, so the glyph walls remain visible against the
+        // cabin sky. Three head shapes (top wedge, main, chin wedge),
+        // chest (kurta), dhoti.
+        Color skin_fill(0x4A, 0x30, 0x28);   // warm head tone
+        Color kurta_fill(0x88, 0x3A, 0x18);  // saffron chest
+        Color dhoti_fill(0x6A, 0x4A, 0x28);  // ochre dhoti
+        // Head — top wedge (row 1, cols 3..9), main (rows 2..4, cols 2..10),
+        // chin wedge (row 5, cols 3..9).
+        it.filled_rectangle(ax + 3 * CW, ay + 1 * CH, 7 * CW, 1 * CH, skin_fill);
+        it.filled_rectangle(ax + 2 * CW, ay + 2 * CH, 9 * CW, 3 * CH, skin_fill);
+        it.filled_rectangle(ax + 3 * CW, ay + 5 * CH, 7 * CW, 1 * CH, skin_fill);
+        // Chest (rows 6..8) — inside torso walls at cols 3 and 9.
+        it.filled_rectangle(ax + 4 * CW, ay + 6 * CH, 5 * CW, 3 * CH, kurta_fill);
+        // Dhoti (rows 9..10) — same width.
+        it.filled_rectangle(ax + 4 * CW, ay + 9 * CH, 5 * CW, 2 * CH, dhoti_fill);
+
+        // Row 0: antennae (e.g. "..---..")
+        {
+          char buf[24];
+          snprintf(buf, sizeof(buf), "   %s   ", antennae);
+          it.print(ax, ay + 0 * CH, id(plex_mono_12), skin, buf);
+        }
+        // Row 1: brow (e.g. "_ _")
+        {
+          char buf[24];
+          snprintf(buf, sizeof(buf), "  /  %s  \\", brow);
+          it.print(ax, ay + 1 * CH, id(plex_mono_12), skin, buf);
+        }
+        // Row 2: eyes
+        {
+          char buf[24];
+          if (strlen(eyes_g) == 5) {
+            snprintf(buf, sizeof(buf), " |  %s  |", eyes_g);
+          } else {
+            snprintf(buf, sizeof(buf), " |   %s   |", eyes_g);
+          }
+          it.print(ax, ay + 2 * CH, id(plex_mono_12), eyes_col, buf);
+        }
+        // Row 3: ears + nose. `C` and `D` are the ears (replacing the
+        // wall pipes on this row); `u` is the nose. Ear pulse decorations
+        // spill outside this envelope.
+        it.print(ax, ay + 3 * CH, id(plex_mono_12), skin, " C    u    D");
+        if (ear_l && ear_l[0]) {
+          int dx_chars = (int)strlen(ear_l);
+          it.print(ax - (dx_chars + 1) * CW, ay + 3 * CH, id(plex_mono_12),
+                   accent, ear_l);
+        }
+        if (ear_r && ear_r[0]) {
+          it.print(ax + 13 * CW + CW, ay + 3 * CH, id(plex_mono_12),
+                   accent, ear_r);
+        }
+        // Row 4: mouth (3- or 5-char). 3-char mouths get cheeks `)` `(`
+        // flanking the mouth — Narada's full-cheeked face. 5-char visemes
+        // (talking-wide) skip cheeks since they fill the inner space.
+        {
+          char buf[24];
+          if (strlen(mouth) == 5) {
+            snprintf(buf, sizeof(buf), " |  %s  |", mouth);
+          } else {
+            snprintf(buf, sizeof(buf), " | ) %s ( |", mouth);
+          }
+          it.print(ax, ay + 4 * CH, id(plex_mono_12),
+                   (act == std::string("speaking")) ? accent : skin, buf);
+        }
+        // Row 5: chin (or namaskaram start)
+        if (act == std::string("greeting")) {
+          it.print(ax, ay + 5 * CH, id(plex_mono_12), skin, "  \\___A___/");
+          it.print(ax, ay + 6 * CH, id(plex_mono_12), skin, "   | / \\");
+          it.print(ax, ay + 7 * CH, id(plex_mono_12), skin, "   |/   \\|");
+          it.print(ax, ay + 8 * CH, id(plex_mono_12), skin, "   |_____|");
+        } else {
+          it.print(ax, ay + 5 * CH, id(plex_mono_12), skin, "  \\_______/");
+          // Neck row carries the top of the sacred thread `/`.
+          it.print(ax, ay + 6 * CH, id(plex_mono_12), skin, "   |    /|");
+          // Row 7: shoulders
+          {
+            char buf[24];
+            int pad = (13 - (int)strlen(sh_str)) / 2;
+            snprintf(buf, sizeof(buf), "%*s%s", pad, "", sh_str);
+            it.print(ax, ay + 7 * CH, id(plex_mono_12), skin, buf);
+          }
+          // Row 8: hands
+          {
+            char buf[24];
+            int pad = (13 - (int)strlen(hd_str)) / 2;
+            snprintf(buf, sizeof(buf), "%*s%s", pad, "", hd_str);
+            it.print(ax, ay + 8 * CH, id(plex_mono_12), skin, buf);
+          }
+        }
+        // Row 9: waist — dhoti drape `\` starts here.
+        it.print(ax, ay + 9 * CH, id(plex_mono_12), skin, "   |  \\  |");
+        // Row 10: lower body — dhoti continues into the belt.
+        it.print(ax, ay + 10 * CH, id(plex_mono_12), skin, "   |___\\_|");
+        // Row 11: legs
+        {
+          char buf[24];
+          snprintf(buf, sizeof(buf), "   %s", legs);
+          it.print(ax, ay + 11 * CH, id(plex_mono_12), skin, buf);
+        }
+
+        // Floating accents (z's, ?'s, !, music notes).
+        if (act == std::string("dreaming")) {
+          int zphase = (int)(bhumi_now_ms / 700UL) % 3;
+          Color zc(0xA0, 0xA8, 0xC0);
+          int zx = ax + 14 * CW + zphase * CW;
+          int zy = ay + 0 * CH - zphase * CH;
+          it.print(zx, zy, id(plex_mono_12), zc, "z");
+          it.print(zx + 2 * CW, zy - CH, id(plex_mono_12), zc, "Z");
+        } else if (act == std::string("thinking")) {
+          Color qc(0xC0, 0xC4, 0xD0);
+          int qphase = (int)(bhumi_now_ms / 500UL) % 2;
+          it.print(ax + 14 * CW, ay + (qphase ? -1 : -2) * CH,
+                   id(plex_mono_12), qc, "?");
+          it.print(ax + 15 * CW, ay + (qphase ? -2 : -3) * CH,
+                   id(plex_mono_12), qc, "?");
+        } else if (act == std::string("surprised")) {
+          it.print(ax - CW, ay - CH, id(plex_mono_12), accent, "!");
+          it.print(ax + 14 * CW, ay - CH, id(plex_mono_12), accent, "!");
+        }
+
+        // ----- Live STT transcript — scrolling band above Narada -----
+        // While listening, the desktop bridge pushes partial transcripts
+        // via set_stt_transcript. We show the most recent N chars with
+        // a leading "..." when it overflows, so the latest words are
+        // always visible at the right edge.
+        if (!id(stt_transcript).empty()) {
+          const std::string& transcript = id(stt_transcript);
+          // 16px Plex Mono advance ~10px → 30 chars per row × 2 rows.
+          // Only scroll (with leading "...") when text exceeds the panel.
+          const int per_row = 30;
+          const int max_total = per_row * 2;
+          const int CW_16 = 10;
+          std::string visible;
+          if ((int)transcript.length() <= max_total) {
+            visible = transcript;
+          } else {
+            visible = "..." + transcript.substr(transcript.length()
+                                                 - (max_total - 3));
+          }
+          // 1-row mode when text fits on a single row; 2-row otherwise.
+          bool two_rows = (int)visible.length() > per_row;
+          std::string row1, row2;
+          if (two_rows) {
+            row1 = visible.substr(0, per_row);
+            row2 = visible.substr(per_row);
+          } else {
+            row1 = visible;
+          }
+          // Last word starts at last space + 1 (or 0 if no space).
+          size_t last_space = visible.rfind(' ');
+          int last_word_start = (last_space == std::string::npos)
+                                  ? 0 : (int)last_space + 1;
+
+          // White panel — height varies with row count.
+          Color bg(0xF8, 0xF8, 0xF0);
+          Color text_black(0x18, 0x18, 0x18);
+          Color text_red(0xC8, 0x18, 0x18);
+          int bg_h = two_rows ? 40 : 20;
+          it.filled_rectangle(0, 12, 320, bg_h, bg);
+
+          // Per-row painter: split into pre-last-word (black) + last word (red).
+          auto paint_row = [&](int y_px, int row_offset_in_visible,
+                                const std::string& row) {
+            int split = last_word_start - row_offset_in_visible;
+            if (split >= (int)row.length()) {
+              it.print(8, y_px, id(plex_mono_16), text_black, row.c_str());
+            } else if (split <= 0) {
+              it.print(8, y_px, id(plex_mono_16), text_red, row.c_str());
+            } else {
+              std::string blk = row.substr(0, split);
+              std::string rd = row.substr(split);
+              it.print(8, y_px, id(plex_mono_16), text_black, blk.c_str());
+              it.print(8 + (int)blk.length() * CW_16, y_px,
+                       id(plex_mono_16), text_red, rd.c_str());
+            }
+          };
+          paint_row(12, 0, row1);
+          if (two_rows && !row2.empty()) {
+            paint_row(32, per_row, row2);
+          }
+        }
+
+        // ----- Speech bubble — ASCII art frame, right side of screen -----
+        // Drawn entirely with glyphs (no filled rectangles or lines), to
+        // match the all-character aesthetic of the alien itself. Tail
+        // (`<` and `\`) extrudes left toward the alien's mouth. Multi-line
+        // word wrap with vertical line scroll at 1 line / 2s on overflow.
+        if (has_speech) {
+          const std::string& speech = id(alien_speech);
+          const int W = 28;            // outer bubble width in chars
+          const int H = 11;            // outer bubble height in rows
+          const int bcol = 16;         // bubble left col (where `/` sits)
+          const int brow = 5;          // bubble top row (top edge underscores)
+          Color frame(0xF8, 0xF8, 0xF0);
+          Color text_color(0x28, 0x18, 0x10);
+          // Aged-parchment interior — warmer / yellower than cream.
+          Color bubble_fill(0xE8, 0xD4, 0xA8);
+
+          // Centered fill inside the ASCII frame: inset 1 char + 2px on
+          // each side so the `/`, `\`, `|`, `_` frame chars draw cleanly.
+          int fill_x = (bcol + 1) * CW + 2;
+          int fill_y = (brow + 1) * CH + 2;
+          int fill_w = (W - 2) * CW - 4;
+          int fill_h = (H - 2) * CH - 4;
+          it.filled_rectangle(fill_x, fill_y, fill_w, fill_h, bubble_fill);
+
+          // Buffers for the frame rows (W chars each, plus null term).
+          char top_edge[40], top_corner[40], side[40], bot[40];
+          // Top edge: " " + (W-2)*"_" + " "
+          top_edge[0] = ' ';
+          for (int i = 1; i < W - 1; i++) top_edge[i] = '_';
+          top_edge[W - 1] = ' '; top_edge[W] = '\0';
+          // Top corners: "/" + (W-2)*" " + "\\"
+          top_corner[0] = '/';
+          for (int i = 1; i < W - 1; i++) top_corner[i] = ' ';
+          top_corner[W - 1] = '\\'; top_corner[W] = '\0';
+          // Side: "|" + (W-2)*" " + "|"
+          side[0] = '|';
+          for (int i = 1; i < W - 1; i++) side[i] = ' ';
+          side[W - 1] = '|'; side[W] = '\0';
+          // Bottom: "\\" + (W-2)*"_" + "/"
+          bot[0] = '\\';
+          for (int i = 1; i < W - 1; i++) bot[i] = '_';
+          bot[W - 1] = '/'; bot[W] = '\0';
+
+          int bx_px = bcol * CW;
+          int by_px = brow * CH;
+          // Frame rows.
+          it.print(bx_px, by_px,                id(plex_mono_12), frame, top_edge);
+          it.print(bx_px, by_px + 1 * CH,       id(plex_mono_12), frame, top_corner);
+          // Tail rows: row 2 has `<` at col bcol-2, no left wall;
+          // row 3 has `\` at col bcol-1, no left wall. Right wall stays.
+          char tail_row[40];
+          for (int i = 0; i < W; i++) tail_row[i] = ' ';
+          tail_row[W - 1] = '|'; tail_row[W] = '\0';
+          // Row 2 (tail mid).
+          it.print(bx_px - 2 * CW, by_px + 2 * CH, id(plex_mono_12), frame, "<");
+          it.print(bx_px,          by_px + 2 * CH, id(plex_mono_12), frame, tail_row);
+          // Row 3 (tail bot).
+          it.print(bx_px - 1 * CW, by_px + 3 * CH, id(plex_mono_12), frame, "\\");
+          it.print(bx_px,          by_px + 3 * CH, id(plex_mono_12), frame, tail_row);
+          // Body rows.
+          for (int r = 4; r < H - 1; r++) {
+            it.print(bx_px, by_px + r * CH, id(plex_mono_12), frame, side);
+          }
+          // Bottom.
+          it.print(bx_px, by_px + (H - 1) * CH, id(plex_mono_12), frame, bot);
+
+          // ----- Text — wrap into lines, scroll if overflow -----
+          // Text starts 2 chars in from left wall, ends 1 char before right wall.
+          int text_col = bcol + 2;
+          int chars_per_line = W - 4;
+          if (chars_per_line < 4) chars_per_line = 4;
+          // Text rows: bubble rows 2..H-2 (skip top edge/corner and bottom).
+          int text_top_row = brow + 2;
+          int max_lines = (H - 1) - 2;   // rows 2..H-2 inclusive
+          // Word-wrap.
+          std::vector<std::string> lines;
+          {
+            std::string cur, word;
+            for (size_t i = 0; i <= speech.size(); i++) {
+              char c = (i < speech.size()) ? speech[i] : ' ';
+              if (c == ' ' || c == '\n') {
+                if (!word.empty()) {
+                  if ((int)(cur.size() + (cur.empty() ? 0 : 1) + word.size())
+                        <= chars_per_line) {
+                    if (!cur.empty()) cur += ' ';
+                    cur += word;
+                  } else {
+                    if (!cur.empty()) lines.push_back(cur);
+                    if ((int)word.size() <= chars_per_line) {
+                      cur = word;
+                    } else {
+                      for (size_t j = 0; j < word.size(); j += chars_per_line) {
+                        lines.push_back(word.substr(j, chars_per_line));
+                      }
+                      cur.clear();
+                    }
+                  }
+                  word.clear();
+                }
+                if (c == '\n') {
+                  if (!cur.empty()) lines.push_back(cur);
+                  cur.clear();
+                }
+              } else {
+                word += c;
+              }
+            }
+            if (!cur.empty()) lines.push_back(cur);
+          }
+          int scroll = 0;
+          if ((int)lines.size() > max_lines) {
+            scroll = (int)((bhumi_now_ms / 2000UL)
+                           % (uint32_t)(lines.size() - max_lines + 1));
+          }
+          for (int i = 0; i < max_lines && (scroll + i) < (int)lines.size(); i++) {
+            it.print(text_col * CW, (text_top_row + i) * CH,
+                     id(plex_mono_12), text_color, lines[scroll + i].c_str());
+          }
+        }
+        return;
+      }
+
+      // ===================================================================
+      // CYCLE 2.6 — `horizon` engine, weather-aware. ASCII-only vocabulary.
+      // The body lives in Kallangur, QLD. Cognition pushes Open-Meteo data
+      // via set_weather; the lambda renders trees swaying with real wind,
+      // clouds scaled by overcast %, rain falling when precipitation > 0,
+      // sun position by Brisbane local time. Stars at night when not too
+      // overcast.  See embodiment/design/v1.0-substrate-engines.md §horizon.
+      // ===================================================================
+
+      static const int COLS = 44;
+      static const int ROWS = 16;
+      static const int CELL_W = 7;
+      static const int CELL_H = 14;
+      static const int HORIZON_ROW = 11;       // top of grass band (color split)
+      static const int N_STARS = 25;
+      static const int N_TREES = 12;           // 4 background + 4 mid + 4 foreground
+      static const int MAX_CLOUDS = 4;
+      static const int MAX_DROPS = 60;
+
+      static int     star_x[N_STARS];
+      static int     star_y[N_STARS];     // rows 0..6
+      static float   star_phase[N_STARS];
+
+      static int     tree_col[N_TREES];      // base column
+      static int     tree_h[N_TREES];        // total height (cells)
+      static int     tree_crown_w[N_TREES];  // crown max width
+      static int     tree_plane[N_TREES];    // 0=horizon, 1=mid, 2=fg
+      static int     tree_trunk_h[N_TREES];  // trunk rows; 0 = bush (no trunk)
+      static int     tree_lean[N_TREES];     // crown horizontal offset (-2..+2)
+      static float   tree_phase[N_TREES];
+
+      static float   cloud_x[MAX_CLOUDS];
+      // Smaller, more line-like clouds. Each one a slight variation of
+      // a horizontal stroke — distinct shape per cloud index, no two
+      // identical. Higher in sky (lower y) = closer overhead = parallax-
+      // faster drift.
+      static const int cloud_y[MAX_CLOUDS] = {1, 4, 2, 5};
+      static const int cloud_w[MAX_CLOUDS] = {4, 3, 5, 3};
+
+      static float   drop_x[MAX_DROPS];
+      static float   drop_y[MAX_DROPS];
+
+      // Bird state — rare traversal across the sky.
+      static float   bird_x = -10.0f;
+      static int     bird_y = 4;
+      static int     bird_dir = 1;          // +1 = west→east, -1 = east→west
+      static uint32_t bird_last_ms = 0;
+      static uint32_t bird_next_ms = 30000; // first bird ~30s after boot
+
+      // Lightning state — only used when weather_code in {95,96,99}.
+      static uint32_t lightning_until = 0;
+      static uint32_t lightning_next  = 0;
+
+      static uint32_t last_anim_ms = 0;
+      static uint32_t heart_origin_ms = 0;
+      static bool     initialized = false;
+
+      uint32_t now_ms = millis();
+
+      if (!initialized) {
+        uint32_t s = 0xa11ce5u;
+        // Stars in sky band rows 0-6, xorshift positions, random phases.
+        for (int i = 0; i < N_STARS; i++) {
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          star_x[i] = (int)(s % COLS);
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          star_y[i] = (int)(s % 7);
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          star_phase[i] = (float)(s % 1000) / 1000.0f * 6.2831853f;
+        }
+        // 12 plants in three depth planes — atmospheric perspective.
+        // Heights are deliberately varied (not uniform) and some plants
+        // are bushes (trunk_h = 0) instead of trees, so the silhouette
+        // has visual rhythm rather than a uniform forest.
+        //   plane 0 = ON HORIZON — tiny silhouettes on the horizon row.
+        //   plane 1 = MIDGROUND — short/medium plants on the grass.
+        //   plane 2 = FOREGROUND — modest trees and bushes (h=3-6, NOT
+        //             skyscraper-tall — they shouldn't dominate airspace).
+        // The `lean` field offsets the crown horizontally relative to
+        // the trunk so trees aren't all symmetric blobs.
+        // Bigger, more iconic conifer triangles per Suti's reference.
+        // Foreground heights bumped back to h=6-7 (cw=5-7) so they read
+        // as proper triangular trees, not blobs.
+        const int t_cols[N_TREES]    = {  4, 14, 22, 30,   8, 18, 33, 39,    2,  9, 35, 42};
+        const int t_h[N_TREES]       = {  1,  2,  1,  2,   4,  3,  5,  3,    7,  6,  7,  6};
+        const int t_cw[N_TREES]      = {  1,  1,  1,  1,   3,  3,  3,  3,    7,  5,  7,  5};
+        const int t_plane[N_TREES]   = {  0,  0,  0,  0,   1,  1,  1,  1,    2,  2,  2,  2};
+        const int t_trunk_h[N_TREES] = {  0,  0,  0,  0,   1,  0,  2,  1,    2,  2,  2,  2};
+        const int t_lean[N_TREES]    = {  0,  0,  0,  0,   0,  0,  0,  0,    0,  0,  0,  0};
+        for (int t = 0; t < N_TREES; t++) {
+          tree_col[t]     = t_cols[t];
+          tree_h[t]       = t_h[t];
+          tree_crown_w[t] = t_cw[t];
+          tree_plane[t]   = t_plane[t];
+          tree_trunk_h[t] = t_trunk_h[t];
+          tree_lean[t]    = t_lean[t];
+          s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+          tree_phase[t] = (float)(s % 1000) / 1000.0f * 6.2831853f;
+        }
+        // Cloud starting positions spread across the sky band.
+        for (int c = 0; c < MAX_CLOUDS; c++) {
+          cloud_x[c] = (float)(c * 12);
+        }
+        // Rain drops parked offscreen; activated only when precip > 0.
+        for (int d = 0; d < MAX_DROPS; d++) {
+          drop_x[d] = -1.0f;
+          drop_y[d] = -1.0f;
+        }
+        last_anim_ms    = now_ms;
+        heart_origin_ms = now_ms;
+        initialized = true;
+      }
+
+      // ----- heart period from sleep_pressure ----------------------------
+      float sp = id(vitality_sleep_pressure);
+      float period_ms;
+      if (sp <= 0.3f) {
+        period_ms = 1200.0f + (sp / 0.3f) * 800.0f;
+      } else if (sp <= 0.5f) {
+        period_ms = 2000.0f + ((sp - 0.3f) / 0.2f) * 1500.0f;
+      } else if (sp <= 0.85f) {
+        period_ms = 3500.0f + ((sp - 0.5f) / 0.35f) * 1500.0f;
+      } else {
+        period_ms = 5000.0f;
+      }
+      float phase = fmodf((float)(now_ms - heart_origin_ms), period_ms)
+                    / period_ms * 6.2831853f;
+      int pulse_offset = (int)roundf(sinf(phase));  // -1, 0, +1
+
+      // ----- mood tint: bilinear blend of 4 corner colors ----------------
+      float v_norm = (id(mood_valence) + 1.0f) * 0.5f;
+      float a_norm = id(mood_arousal);
+      auto blend = [&](float c00, float c10, float c01, float c11) -> uint8_t {
+        float r = (1.0f - v_norm) * (1.0f - a_norm) * c00
+                + v_norm           * (1.0f - a_norm) * c10
+                + (1.0f - v_norm) * a_norm           * c01
+                + v_norm           * a_norm           * c11;
+        if (r < 0.0f)   r = 0.0f;
+        if (r > 255.0f) r = 255.0f;
+        return (uint8_t)r;
+      };
+      Color tint(
+        blend(0x4A, 0xC4, 0xB0, 0x7A),
+        blend(0x55, 0x96, 0x40, 0x50),
+        blend(0x60, 0x2A, 0x60, 0x8C)
+      );
+
+      // ----- Brisbane local time -> sun position --------------------------
+      float hour_of_day = 12.0f;
+      auto t_now = id(sntp_time).now();
+      if (t_now.is_valid()) {
+        hour_of_day = (float)t_now.hour + (float)t_now.minute / 60.0f;
+      }
+      float t_day = (hour_of_day - 6.0f) / 12.0f;
+      bool is_day = (t_day >= 0.0f && t_day <= 1.0f);
+      int sun_x = -1, sun_y_row = -1;
+      const char* sun_glyph = "o";
+      if (is_day) {
+        sun_x = (int)(t_day * (float)(COLS - 1));
+        sun_y_row = (int)roundf(6.0f - sinf(3.14159f * t_day) * 6.0f);
+        if (sun_y_row < 0) sun_y_row = 0;
+        if (sun_y_row > 6) sun_y_row = 6;
+        if (sun_y_row >= 5)      sun_glyph = "@";
+        else if (sun_y_row >= 3) sun_glyph = "O";
+        else                     sun_glyph = "o";
+      }
+
+      // ----- weather reads ------------------------------------------------
+      float wind_kmh    = id(weather_wind_speed_kmh);
+      float wind_dir    = id(weather_wind_direction_deg);
+      float precip_mmhr = id(weather_precipitation_mm_hr);
+      float cloud_pct   = id(weather_cloud_cover_pct);
+      bool  is_raining  = (precip_mmhr > 0.05f);
+      bool  is_overcast = (cloud_pct >= 75.0f);
+      // Wind sign: positive ~ blowing toward the east. Map dir 0=N, 90=E, 180=S, 270=W.
+      // Easterly component = sin(dir_rad). +1 = east wind, -1 = west wind.
+      float wind_east = sinf(wind_dir * 3.14159f / 180.0f);
+      // Sway amplitude in cells: 0 calm -> ~3 cells at 75 km/h.
+      float sway_amp  = wind_kmh / 25.0f;
+      if (sway_amp > 3.0f) sway_amp = 3.0f;
+
+      // Cloud count from cloud cover %. ceil-style so any cloud cover at
+      // all gives at least one cloud, and 32% gives 2 not 1 (so the sky
+      // isn't bare for stretches when the lone cloud drifts off-screen).
+      int n_clouds = (int)ceilf(cloud_pct / 30.0f);
+      if (n_clouds < 0) n_clouds = 0;
+      if (n_clouds > MAX_CLOUDS) n_clouds = MAX_CLOUDS;
+
+      // Rain drop count from precipitation rate.
+      int n_drops = (int)roundf(precip_mmhr * 8.0f);
+      if (n_drops < 0) n_drops = 0;
+      if (n_drops > MAX_DROPS) n_drops = MAX_DROPS;
+
+      // ----- animation tick ----------------------------------------------
+      float dt_s = (float)(now_ms - last_anim_ms) / 1000.0f;
+      last_anim_ms = now_ms;
+
+      // Cloud drift: base speed by sleep_pressure (drowsier = slower) and
+      // pushed by easterly wind component. Per-cloud parallax: clouds
+      // higher in the sky (lower y row) are closer to the viewer overhead
+      // and drift faster than clouds near the horizon.
+      float cloud_base = 1.0f / (sp * 5.0f + 1.0f);
+      float cloud_speed = cloud_base + wind_east * (wind_kmh / 30.0f);
+      for (int c = 0; c < MAX_CLOUDS; c++) {
+        // pf: row 1 -> 1.35, row 5 -> 0.75.
+        float pf = 1.5f - (float)cloud_y[c] * 0.15f;
+        cloud_x[c] += cloud_speed * pf * dt_s;
+        if (cloud_x[c] > (float)COLS + 8.0f)  cloud_x[c] = -8.0f;
+        if (cloud_x[c] < -8.0f)               cloud_x[c] = (float)COLS + 8.0f;
+      }
+
+      // Bird traversal — fires roughly every 3-8 minutes if no bird is
+      // currently flying. The bird crosses the sky at constant speed,
+      // wing-flapping every 200ms.
+      bool bird_active = (bird_x >= -2.0f && bird_x <= (float)COLS + 2.0f);
+      if (!bird_active && now_ms >= bird_next_ms) {
+        // Spawn fresh bird.
+        bird_y = 2 + (int)((now_ms / 137) % 5);            // rows 2-6
+        bird_dir = ((now_ms / 211) & 1) ? 1 : -1;
+        bird_x = (bird_dir > 0) ? -2.0f : (float)COLS + 2.0f;
+        bird_last_ms = now_ms;
+        bird_next_ms = now_ms + 180000 + (uint32_t)((now_ms / 7) % 300000);  // 3-8 min
+      }
+      if (bird_x >= -2.0f && bird_x <= (float)COLS + 2.0f) {
+        bird_x += (float)bird_dir * 4.0f * dt_s;            // 4 cells/sec
+      }
+
+      // Lightning: fires only when weather_code indicates thunderstorm.
+      int wcode = id(weather_code);
+      bool storm = (wcode >= 95 && wcode <= 99);
+      if (storm && now_ms >= lightning_next) {
+        lightning_until = now_ms + 90;                       // 90ms flash
+        lightning_next  = now_ms + 5000 + (uint32_t)((now_ms / 11) % 8000);  // 5-13s
+      }
+      bool lightning_active = (now_ms < lightning_until);
+
+      // Rain drop physics: drops fall at ~12 cells/sec, drift x with wind.
+      float drop_fall_rate = 12.0f;
+      float drop_drift_x   = wind_east * (wind_kmh / 20.0f);
+      for (int d = 0; d < n_drops; d++) {
+        if (drop_y[d] < 0.0f) {
+          // Spawn fresh drop at top, random column.
+          drop_x[d] = (float)((d * 71 + (int)(now_ms / 13)) % COLS);
+          drop_y[d] = -((float)(d % 8));
+        }
+        drop_y[d] += drop_fall_rate * dt_s;
+        drop_x[d] += drop_drift_x * dt_s;
+        if (drop_y[d] >= (float)ROWS) {
+          drop_y[d] = -1.0f;  // recycle next frame
+        }
+      }
+      // Inactive drops parked.
+      for (int d = n_drops; d < MAX_DROPS; d++) {
+        drop_y[d] = -1.0f;
+      }
+
+      // ----- render -------------------------------------------------------
+      // Sky color shifts dramatically by hour of day. Day is genuinely
+      // bright; sunset/sunrise are red-orange/pink; twilight is purple;
+      // night is deep blue. Lightning briefly slams the sky toward
+      // bright when active.
+      uint8_t sr=0x08, sg=0x0E, sb=0x18;  // night/default
+      if (hour_of_day >= 4.5f && hour_of_day < 6.0f) {
+        sr = 0x30; sg = 0x18; sb = 0x44;  // pre-dawn deep purple
+      } else if (hour_of_day >= 6.0f && hour_of_day < 7.0f) {
+        sr = 0x60; sg = 0x24; sb = 0x40;  // sunrise pink-magenta
+      } else if (hour_of_day >= 7.0f && hour_of_day < 8.0f) {
+        sr = 0x58; sg = 0x38; sb = 0x40;  // dawn warming
+      } else if (hour_of_day >= 8.0f && hour_of_day < 16.0f) {
+        sr = 0x20; sg = 0x40; sb = 0x70;  // bright day blue
+      } else if (hour_of_day >= 16.0f && hour_of_day < 17.0f) {
+        sr = 0x40; sg = 0x30; sb = 0x40;  // late afternoon warm
+      } else if (hour_of_day >= 17.0f && hour_of_day < 18.0f) {
+        sr = 0x70; sg = 0x28; sb = 0x20;  // sunset red-orange
+      } else if (hour_of_day >= 18.0f && hour_of_day < 19.0f) {
+        sr = 0x50; sg = 0x18; sb = 0x30;  // dusk red-purple
+      } else if (hour_of_day >= 19.0f && hour_of_day < 20.0f) {
+        sr = 0x28; sg = 0x14; sb = 0x40;  // twilight purple
+      }
+      if (lightning_active) {
+        sr = 0x90; sg = 0x90; sb = 0xB0;  // bright flash overrides
+      }
+      Color sky_bg(sr, sg, sb);
+      // Grass background brightens during the day so it doesn't read as
+      // black against the bright sky. Smooth lerp between night and day
+      // colors based on the hour curve.
+      uint8_t gr_n = 0x10, gg_n = 0x16, gb_n = 0x10;       // night
+      uint8_t gr_d = 0x28, gg_d = 0x38, gb_d = 0x1C;       // day
+      // Day-fraction: 1.0 between 8-16, ramps up between 5-8, down 16-19.
+      float day_f = 0.0f;
+      if (hour_of_day >= 8.0f && hour_of_day < 16.0f)        day_f = 1.0f;
+      else if (hour_of_day >= 5.0f && hour_of_day < 8.0f)    day_f = (hour_of_day - 5.0f) / 3.0f;
+      else if (hour_of_day >= 16.0f && hour_of_day < 19.0f)  day_f = 1.0f - (hour_of_day - 16.0f) / 3.0f;
+      uint8_t gr_base = (uint8_t)(gr_n + (gr_d - gr_n) * day_f);
+      uint8_t gg_base = (uint8_t)(gg_n + (gg_d - gg_n) * day_f);
+      uint8_t gb_base = (uint8_t)(gb_n + (gb_d - gb_n) * day_f);
+      // Cycle 2.24 — cloud shadow on the foreground.
+      float shadow_strength = (cloud_pct - 50.0f) / 50.0f * 0.18f;
+      if (shadow_strength < 0.0f) shadow_strength = 0.0f;
+      float shadow_factor = 1.0f - shadow_strength;
+      // Cycle 2.27 — golden hour. ~30 min around sunrise (6.0) and sunset
+      // (17.0), warm amber lights up the foreground. Suppressed by overcast.
+      float sunrise_t = 1.0f - fabsf(hour_of_day - 6.0f) / 0.7f;
+      if (sunrise_t < 0.0f) sunrise_t = 0.0f;
+      float sunset_t = 1.0f - fabsf(hour_of_day - 17.0f) / 0.7f;
+      if (sunset_t < 0.0f) sunset_t = 0.0f;
+      float golden_t = (sunrise_t > sunset_t) ? sunrise_t : sunset_t;
+      float golden_strength = golden_t * 0.55f * shadow_factor;
+      auto warm_shade = [&](float r, float g, float b) -> Color {
+        float wr = r + 55.0f * golden_strength;
+        float wg = g + 25.0f * golden_strength;
+        float wb = b - 20.0f * golden_strength;
+        if (wr < 0.0f) wr = 0.0f; if (wr > 255.0f) wr = 255.0f;
+        if (wg < 0.0f) wg = 0.0f; if (wg > 255.0f) wg = 255.0f;
+        if (wb < 0.0f) wb = 0.0f; if (wb > 255.0f) wb = 255.0f;
+        return Color((uint8_t)(wr * shadow_factor),
+                     (uint8_t)(wg * shadow_factor),
+                     (uint8_t)(wb * shadow_factor));
+      };
+      Color grass_bg = warm_shade((float)gr_base, (float)gg_base, (float)gb_base);
+      it.fill(sky_bg);
+      it.filled_rectangle(0, HORIZON_ROW * CELL_H,
+                          320, 240 - HORIZON_ROW * CELL_H,
+                          grass_bg);
+
+      Color star_color(0xD4, 0xCC, 0xB8);
+      Color sun_color(0xF4, 0xD0, 0x60);
+      Color moon_color(0xC8, 0xCC, 0xD8);   // pale blue-white
+      // Bird silhouette flips by sky brightness — dark against bright
+      // day sky, light against dark night sky.
+      int sky_lum = (int)sr + (int)sg + (int)sb;
+      bool bright_sky = sky_lum > 100;
+      Color bird_color = bright_sky
+        ? Color(0x10, 0x18, 0x28)
+        : Color(0xD0, 0xD8, 0xE0);
+      // Cloud glyphs: bright white in clear weather (high contrast vs
+      // any sky), medium-dark grey in storm (reads against the dimmer
+      // overcast sky).
+      Color cloud_clear(0xE8, 0xEC, 0xF0);
+      Color cloud_rain(0x5A, 0x60, 0x68);
+      Color rain_color(0x6A, 0x90, 0xA8);
+      Color trunk_color = warm_shade(0x55, 0x38, 0x20);
+      Color grass_blade = warm_shade(0x46, 0x60, 0x32);
+
+      // Sky: stars (night only, not overcast), sun (day), moon (night).
+      if (!is_day && cloud_pct < 50.0f) {
+        // Cycle 2.26 — shooting star. Each 30s window has a ~30% chance
+        // of a meteor flashing diagonally across the sky for ~800ms.
+        // Trajectory + timing seeded from the window index, so renders
+        // are deterministic across refreshes within a window.
+        uint32_t win_id = (uint32_t)(now_ms / 30000UL);
+        uint32_t mh = win_id * 2654435761u;
+        if ((mh % 100u) < 30u) {
+          uint32_t fire_ms = (mh >> 8) % 25000u;
+          int32_t elapsed = (int32_t)(now_ms % 30000UL) - (int32_t)fire_ms;
+          if (elapsed >= 0 && elapsed <= 800) {
+            float p = (float)elapsed / 800.0f;
+            int start_col = 30 + (int)((mh >> 16) % 10u);
+            int start_row = (int)((mh >> 24) % 4u);
+            int end_col = 4;
+            int end_row = 6;
+            float cur_c = (float)start_col + (float)(end_col - start_col) * p;
+            float cur_r = (float)start_row + (float)(end_row - start_row) * p;
+            Color head_color(0xF8, 0xF4, 0xD8);
+            it.print((int)roundf(cur_c) * CELL_W, (int)roundf(cur_r) * CELL_H,
+                     id(plex_mono_12), head_color, "*");
+            for (int i = 1; i < 4; i++) {
+              float tp = p - (float)i * 0.06f;
+              if (tp < 0.0f) tp = 0.0f;
+              float tc = (float)start_col + (float)(end_col - start_col) * tp;
+              float tr = (float)start_row + (float)(end_row - start_row) * tp;
+              float fade = 1.0f - (float)i * 0.28f;
+              Color tail_color(
+                (uint8_t)(0xF8 * fade),
+                (uint8_t)(0xF4 * fade),
+                (uint8_t)(0xD8 * fade));
+              const char* glyph = (i == 1) ? "-" : ".";
+              it.print((int)roundf(tc) * CELL_W, (int)roundf(tr) * CELL_H,
+                       id(plex_mono_12), tail_color, glyph);
+            }
+          }
+        }
+        for (int i = 0; i < N_STARS; i++) {
+          float b = (sinf((float)now_ms / 700.0f + star_phase[i]) + 1.0f) * 0.5f;
+          const char* g = nullptr;
+          if (b > 0.65f)      g = "*";
+          else if (b > 0.30f) g = ".";
+          if (g != nullptr) {
+            it.print(star_x[i] * CELL_W, star_y[i] * CELL_H,
+                     id(plex_mono_12), star_color, g);
+          }
+        }
+      }
+
+      // Helper: render a celestial body as 3 stacked filled_circles.
+      // Glow is ADDITIVE on top of sky_bg — outer/mid layers blend
+      // sky_bg + body_col * factor, so the glow always BRIGHTENS the
+      // sky, never darkens it (a previous version multiplied body_col
+      // alone, which read as a dark spot against bright daytime blue).
+      // Both glow brightness AND outer radius pulse — visibly breathes.
+      auto render_celestial = [&](int cx, int cy, Color body_col,
+                                  float pulse_period_ms, int body_r) {
+        if (cx < 0 || cy < 0) return;
+        int px = cx * CELL_W + CELL_W / 2;
+        int py = cy * CELL_H + CELL_H / 2;
+        float pulse = (sinf((float)now_ms / pulse_period_ms) + 1.0f) * 0.5f;
+        auto add_clamped = [](uint8_t base, float bonus) -> uint8_t {
+          int v = (int)base + (int)bonus;
+          if (v < 0)   v = 0;
+          if (v > 255) v = 255;
+          return (uint8_t)v;
+        };
+        // Outer glow: faint additive lift over sky bg.
+        int   outer_r = (int)((float)body_r * (2.6f + pulse * 0.8f));
+        float outer_k = 0.20f + pulse * 0.15f;
+        Color outer(
+          add_clamped(sky_bg.r, (float)body_col.r * outer_k),
+          add_clamped(sky_bg.g, (float)body_col.g * outer_k),
+          add_clamped(sky_bg.b, (float)body_col.b * outer_k)
+        );
+        it.filled_circle(px, py, outer_r, outer);
+        // Mid glow: stronger additive lift.
+        int   mid_r = (int)((float)body_r * (1.6f + pulse * 0.3f));
+        float mid_k = 0.45f + pulse * 0.20f;
+        Color mid(
+          add_clamped(sky_bg.r, (float)body_col.r * mid_k),
+          add_clamped(sky_bg.g, (float)body_col.g * mid_k),
+          add_clamped(sky_bg.b, (float)body_col.b * mid_k)
+        );
+        it.filled_circle(px, py, mid_r, mid);
+        // Sharp body — full color, fixed size.
+        it.filled_circle(px, py, body_r, body_col);
+      };
+
+      // Sun (daytime). One row of top padding (min row = 1) so it
+      // never kisses the screen edge. Body radius bumped to 6 for
+      // ~20% larger presence.
+      if (is_day && cloud_pct < 75.0f && sun_x >= 0) {
+        if (sun_y_row < 1) sun_y_row = 1;
+        render_celestial(sun_x, sun_y_row, sun_color, 1500.0f, 6);
+      }
+
+      // Moon (nighttime). Same top padding + bigger body (radius 5).
+      if (!is_day && cloud_pct < 75.0f) {
+        float t_night;
+        if (hour_of_day >= 18.0f)      t_night = (hour_of_day - 18.0f) / 12.0f;
+        else if (hour_of_day < 6.0f)   t_night = (hour_of_day + 6.0f) / 12.0f;
+        else                            t_night = 0.5f;
+        int moon_x = (int)(t_night * (float)(COLS - 1));
+        int moon_y = (int)roundf(6.0f - sinf(3.14159f * t_night) * 6.0f);
+        if (moon_y < 1) moon_y = 1;
+        if (moon_y > 6) moon_y = 6;
+        render_celestial(moon_x, moon_y, moon_color, 2400.0f, 5);
+      }
+
+      // Clouds — high-contrast glyphs only (no body fill). Bright
+      // white against any clear sky; dark grey against the dimmer
+      // overcast sky during a storm.
+      Color cc = is_raining ? cloud_rain : cloud_clear;
+      // Cloud templates (top row + main row). Empty top means single row.
+      static const char* CLOUD_MAIN[4] = {
+        "~~-.",       // dipped tail
+        "----~~.",    // line into wisp (longer)
+        ".~~~~~.",    // tapered wisp
+        "~~.~",       // broken middle
+      };
+      static const char* CLOUD_TOP[4] = {
+        "",           // single row
+        "~~~.",       // wisp above the line
+        "",           // single row
+        "___",        // tendrils above
+      };
+      static const int CLOUD_TOP_OFFSET[4] = { 0, 1, 0, 1 };
+      static const int CLOUD_MAIN_LEN[4]  = { 4, 7, 7, 4 };
+      static const int CLOUD_TOP_LEN[4]   = { 0, 4, 0, 3 };
+      // Storm register: substitute = / + for the heavier glyphs.
+      for (int c = 0; c < n_clouds; c++) {
+        int base_x = (int)cloud_x[c];
+        int y      = cloud_y[c];
+        int idx    = c & 3;
+        int main_len = CLOUD_MAIN_LEN[idx];
+        const char* main_p = CLOUD_MAIN[idx];
+        for (int k = 0; k < main_len; k++) {
+          int col = base_x + k;
+          if (col < 0 || col >= COLS) continue;
+          char ch = main_p[k];
+          if (is_raining) {
+            if (ch == '~') ch = '=';
+            else if (ch == '-') ch = '+';
+          }
+          char buf[2] = { ch, 0 };
+          it.print(col * CELL_W, y * CELL_H, id(plex_mono_12), cc, buf);
+        }
+        // Top wisp row.
+        if (CLOUD_TOP_LEN[idx] > 0 && y > 0) {
+          const char* top_p = CLOUD_TOP[idx];
+          int top_off = CLOUD_TOP_OFFSET[idx];
+          for (int k = 0; k < CLOUD_TOP_LEN[idx]; k++) {
+            int col = base_x + top_off + k;
+            if (col < 0 || col >= COLS) continue;
+            char ch = top_p[k];
+            if (is_raining && ch == '~') ch = '=';
+            char buf[2] = { ch, 0 };
+            it.print(col * CELL_W, (y - 1) * CELL_H, id(plex_mono_12), cc, buf);
+          }
+        }
+      }
+
+      // Bird traversal — single glyph (`v` or `^` for wing flap) crossing
+      // the sky. Rendered above clouds so it reads as foreground sky.
+      if (bird_x >= 0.0f && bird_x < (float)COLS) {
+        int bx = (int)roundf(bird_x);
+        const char* g = ((now_ms / 200) & 1) ? "v" : "^";
+        it.print(bx * CELL_W, bird_y * CELL_H,
+                 id(plex_mono_12), bird_color, g);
+      }
+
+      // Rain — vertical streaks falling, drifting with wind.
+      for (int d = 0; d < n_drops; d++) {
+        if (drop_y[d] < 0.0f) continue;
+        int dx = (int)roundf(drop_x[d]);
+        int dy = (int)roundf(drop_y[d]);
+        if (dx < 0 || dx >= COLS) continue;
+        if (dy < 0 || dy >= ROWS) continue;
+        // Slanted glyph hints at wind direction; vertical when calm.
+        const char* g;
+        if (wind_east > 0.4f)       g = "/";
+        else if (wind_east < -0.4f) g = "\\";
+        else                        g = "|";
+        it.print(dx * CELL_W, dy * CELL_H, id(plex_mono_12), rain_color, g);
+      }
+
+      // Grass field — density gradient from row 10 (~10%) to row 15
+      // (~75%). Glyph chosen by a traveling wind wave: wave_pos moves
+      // across the field at wind speed, and each cell's height (which
+      // glyph to draw) is sin((col - wave_pos) * freq). Reads as a wave
+      // of wind passing through the grass. Direction of travel matches
+      // wind direction (east-positive wave moves left to right).
+      static const int row_density[ROWS] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // sky band
+        10, 20, 35, 50, 65, 78,           // grass density ramp
+      };
+      // Wave speed: direction comes from the sign of the easterly
+      // component (so south winds and calm don't kill the wave), but
+      // magnitude tracks wind_kmh — calm = gentle drift, gusty = fast
+      // wave traveling across the field.
+      float wind_dir_sign = (wind_east >= 0.0f) ? 1.0f : -1.0f;
+      float wave_speed    = wind_dir_sign * (0.6f + wind_kmh / 8.0f);
+      float wave_pos   = (float)now_ms / 1000.0f * wave_speed;
+      // Cycle 2.23 — blades bend WITH the wind. bend_strength uses the
+      // east-west component so a north wind doesn't lean grass east or
+      // west. Lean glyph picks \\ for east, / for west; very strong wind
+      // flattens to _.
+      float bend_strength = fabsf(wind_east) * wind_kmh / 30.0f;
+      const char* lean_glyph = (wind_east >= 0.0f) ? "\\" : "/";
+      for (int row = 10; row < ROWS; row++) {
+        int dens = row_density[row];
+        // Add a secondary wave component per row offset so different
+        // rows ripple at slightly different phases — more depth.
+        float row_phase = (float)(row - 10) * 0.4f;
+        for (int col = 0; col < COLS; col++) {
+          uint32_t h = (uint32_t)col * 2654435761u + (uint32_t)row * 1597334677u;
+          int roll = (int)((h >> 8) % 100);
+          if (roll >= dens) continue;
+          float phase = ((float)col - wave_pos) * 0.30f + row_phase;
+          float wv = sinf(phase);
+          const char* g;
+          if (bend_strength < 0.20f) {
+            // Calm — original upright wave glyphs.
+            if (wv > 0.55f)       g = "'";
+            else if (wv > 0.05f)  g = ",";
+            else if (wv > -0.55f) g = ":";
+            else                   g = ".";
+          } else if (bend_strength < 0.65f) {
+            // Leaning — wave peaks lift as a leaning blade.
+            if (wv > 0.30f)       g = lean_glyph;
+            else if (wv > -0.30f) g = ",";
+            else                   g = ".";
+          } else {
+            // Flattened — most blades pressed flat with a few still leaning.
+            if (wv > 0.40f)       g = lean_glyph;
+            else                   g = "_";
+          }
+          it.print(col * CELL_W, row * CELL_H,
+                   id(plex_mono_12), grass_blade, g);
+        }
+      }
+
+      // Trees — three depth planes for atmospheric perspective.
+      // plane 0 (HORIZON): tiny silhouettes sitting on the horizon row.
+      //   Render as 1-2 glyphs ABOVE row 11 — they read as distant trees
+      //   against the sky-grass color split. No trunk, no sway.
+      // plane 1 (MIDGROUND): trunk + crown standing on the grass.
+      // plane 2 (FOREGROUND): tall trees, crown high, trunks running all
+      //   the way down to row 15 (implies tree continues below screen).
+      //   2-cell trunks for visual weight.
+      static const float plane_blend[3] = { 0.65f, 0.35f, 0.0f };
+      static const float plane_sway[3]  = { 0.0f,  0.6f,  1.0f };
+      static const char* trunk_glyphs[2] = { "|", "!" };
+      // Foliage palette — 4 shades of green / yellow-green so the forest
+      // has visible variety. Each tree picks one shade by its index, so
+      // the same tree always has the same color across frames.
+      static const uint8_t foliage_body_pal[4][3] = {
+        { 0x4A, 0x68, 0x28 },  // bright spring green
+        { 0x68, 0x78, 0x30 },  // yellow-green / chartreuse
+        { 0x38, 0x5A, 0x28 },  // dark forest green
+        { 0x58, 0x6E, 0x38 },  // olive
+      };
+      static const uint8_t foliage_hi_pal[4][3] = {
+        { 0x8A, 0xA8, 0x58 },
+        { 0xA0, 0xB0, 0x48 },
+        { 0x70, 0x9A, 0x48 },
+        { 0x9A, 0xB0, 0x68 },
+      };
+      Color trunk_body_base = warm_shade(0x3C, 0x28, 0x18);
+      for (int t = 0; t < N_TREES; t++) {
+        int p        = tree_plane[t];
+        int base_col = tree_col[t];
+        int h        = tree_h[t];
+        int cw       = tree_crown_w[t];
+        float pb = plane_blend[p];
+        // Per-tree foliage colors from the palette (cycled by index).
+        // Cycle 2.24: shadow_factor dims the palette entries when overcast.
+        const uint8_t* hi_rgb = foliage_hi_pal[t & 3];
+        Color tree_color(
+          (uint8_t)((float)hi_rgb[0] * shadow_factor * (1.0f - pb) + (float)grass_bg.r * pb),
+          (uint8_t)((float)hi_rgb[1] * shadow_factor * (1.0f - pb) + (float)grass_bg.g * pb),
+          (uint8_t)((float)hi_rgb[2] * shadow_factor * (1.0f - pb) + (float)grass_bg.b * pb)
+        );
+        Color this_trunk(
+          (uint8_t)((float)trunk_color.r * (1.0f - pb) + 0x10 * pb),
+          (uint8_t)((float)trunk_color.g * (1.0f - pb) + 0x16 * pb),
+          (uint8_t)((float)trunk_color.b * (1.0f - pb) + 0x10 * pb)
+        );
+
+        // Plane 0: horizon silhouettes — pure render, no animation.
+        if (p == 0) {
+          for (int rk = 0; rk < h; rk++) {
+            int r = HORIZON_ROW - rk;
+            int col = base_col;
+            if (col < 0 || col >= COLS) continue;
+            const char* g = (rk == 0) ? "*" : ((t & 1) ? "'" : ",");
+            it.print(col * CELL_W, r * CELL_H,
+                     id(plex_mono_12), tree_color, g);
+          }
+          continue;
+        }
+
+        // Planes 1 + 2: standing plant. trunk_h=0 means a bush (crown
+        // only, no trunk). lean offsets the crown horizontally for
+        // asymmetry — not all trees are symmetric blobs.
+        // Two boosted slow oscillations are superimposed on top of the
+        // wind-driven sway so the trees keep moving — peaks regularly
+        // round to ±1 cell — even when there's no wind at all.
+        float wind_sway  = sinf((float)now_ms / 800.0f + tree_phase[t]) * sway_amp;
+        float micro_a    = sinf((float)now_ms / 4500.0f + tree_phase[t] * 1.5f) * 0.6f;
+        float micro_b    = sinf((float)now_ms / 1700.0f + tree_phase[t] * 2.3f) * 0.5f;
+        float crown_sway = (wind_sway + micro_a + micro_b) * plane_sway[p];
+        float trunk_sway = (wind_sway * 0.4f + (micro_a + micro_b) * 0.5f) * plane_sway[p];
+        int crown_dx = (int)roundf(crown_sway) + tree_lean[t];
+        int trunk_dx = (int)roundf(trunk_sway);
+
+        int trunk_h = tree_trunk_h[t];
+        if (trunk_h > h - 1) trunk_h = h - 1;
+        int crown_h = h - trunk_h;
+        if (crown_h < 1) crown_h = 1;
+        int crown_top = ROWS - h;
+        if (crown_top < 0) crown_top = 0;
+        int trunk_top = crown_top + crown_h;
+        if (trunk_top > ROWS) trunk_top = ROWS;
+        int trunk_w = (p == 2 && trunk_h >= 2) ? 2 : 1;
+
+        // Per-plane blended trunk body color (toward grass_bg for distance).
+        Color trunk_body(
+          (uint8_t)((float)trunk_body_base.r * (1.0f - pb) + (float)grass_bg.r * pb),
+          (uint8_t)((float)trunk_body_base.g * (1.0f - pb) + (float)grass_bg.g * pb),
+          (uint8_t)((float)trunk_body_base.b * (1.0f - pb) + (float)grass_bg.b * pb)
+        );
+        // Per-plane blended foliage body — uses the per-tree palette
+        // entry. The foliage stands out against the grass; the highlight
+        // glyphs will sit on top in a brighter shade.
+        const uint8_t* body_rgb = foliage_body_pal[t & 3];
+        Color foliage_body(
+          (uint8_t)((float)body_rgb[0] * shadow_factor * (1.0f - pb) + (float)grass_bg.r * pb),
+          (uint8_t)((float)body_rgb[1] * shadow_factor * (1.0f - pb) + (float)grass_bg.g * pb),
+          (uint8_t)((float)body_rgb[2] * shadow_factor * (1.0f - pb) + (float)grass_bg.b * pb)
+        );
+
+        // Trunk body fill — narrow brown rectangle behind the glyphs.
+        if (trunk_h > 0) {
+          int trunk_rect_left = (base_col + trunk_dx) * CELL_W + 1;
+          int trunk_rect_w    = trunk_w * CELL_W - 2;
+          int trunk_rect_top  = trunk_top * CELL_H;
+          int trunk_rect_h    = (ROWS - trunk_top) * CELL_H;
+          if (trunk_rect_left >= 0 && trunk_rect_left + trunk_rect_w < 320) {
+            it.filled_rectangle(trunk_rect_left, trunk_rect_top,
+                                trunk_rect_w, trunk_rect_h, trunk_body);
+          }
+        }
+
+        // Trunk glyphs on top of the body fill.
+        for (int r = trunk_top; r < ROWS; r++) {
+          for (int dx = 0; dx < trunk_w; dx++) {
+            int col = base_col + trunk_dx + dx;
+            if (col < 0 || col >= COLS) continue;
+            int gi = (r + dx + t + (int)(now_ms / 4000)) & 1;
+            it.print(col * CELL_W, r * CELL_H,
+                     id(plex_mono_12), this_trunk, trunk_glyphs[gi]);
+          }
+        }
+
+        // Crown shape depends on species:
+        //   pine:  triangular, width grows 1 -> cw, all `*`
+        //   oak:   rounded oval, width bulges in middle, glyph mix
+        //   mixed: alternate per tree index (even=pine, odd=oak)
+        int species = id(visual_tree_species);
+        bool is_oak = (species == 1) || (species == 2 && (t & 1));
+
+        // Crown body fill — solid foliage shape under the glyph
+        // highlights. Pine gets a stack of filled_rectangles forming
+        // a triangle; oak gets a filled_circle/ellipse for a round
+        // canopy.
+        if (is_oak) {
+          // Oak: filled circle centered on crown.
+          int body_cx = (base_col + crown_dx) * CELL_W + CELL_W / 2;
+          int body_cy = (crown_top + crown_h / 2) * CELL_H + CELL_H / 2;
+          int body_r  = (cw * CELL_W) / 2 - 1;
+          if (body_r > 0) {
+            it.filled_circle(body_cx, body_cy, body_r, foliage_body);
+          }
+        } else {
+          // Pine: triangular stack of filled_rectangles widening down.
+          for (int rk = 0; rk < crown_h; rk++) {
+            int r = crown_top + rk;
+            if (r < 0 || r >= ROWS) continue;
+            int w_here = 1 + (rk * (cw - 1)) /
+                              (crown_h > 1 ? crown_h - 1 : 1);
+            if (w_here < 1)  w_here = 1;
+            if (w_here > cw) w_here = cw;
+            int half_l = w_here / 2;
+            int rect_left = (base_col + crown_dx - half_l) * CELL_W;
+            int rect_w    = w_here * CELL_W;
+            int rect_top  = r * CELL_H + 2;
+            int rect_h    = CELL_H - 2;
+            if (rect_left + rect_w > 0 && rect_left < 320) {
+              it.filled_rectangle(rect_left, rect_top, rect_w, rect_h,
+                                  foliage_body);
+            }
+          }
+        }
+        for (int rk = 0; rk < crown_h; rk++) {
+          int r = crown_top + rk;
+          if (r < 0 || r >= ROWS) continue;
+          int w_here;
+          if (is_oak) {
+            // Oak: bell-curve width via sine — bulges in middle,
+            // tapers at top and bottom.
+            float frac = (float)(rk + 1) / (float)(crown_h + 1);
+            float sw = sinf(3.14159f * frac);
+            w_here = (int)roundf((float)cw * sw);
+            if (w_here < 1)  w_here = 1;
+            if (w_here > cw) w_here = cw;
+          } else {
+            // Pine: triangle, narrow at top -> wide at base.
+            w_here = 1 + (rk * (cw - 1)) /
+                          (crown_h > 1 ? crown_h - 1 : 1);
+            if (w_here < 1)  w_here = 1;
+            if (w_here > cw) w_here = cw;
+          }
+          int half_l = w_here / 2;
+          int half_r = w_here - 1 - half_l;
+          for (int k = -half_l; k <= half_r; k++) {
+            int col = base_col + crown_dx + k;
+            if (col < 0 || col >= COLS) continue;
+            const char* g;
+            if (is_oak) {
+              // Oak glyph mix: edges `*`, interior `o`, exact center `O`.
+              if (k == -half_l || k == half_r)  g = "*";
+              else if (k == 0 && w_here >= 3)   g = "O";
+              else                              g = "o";
+            } else {
+              g = "*";
+            }
+            it.print(col * CELL_W, r * CELL_H,
+                     id(plex_mono_12), tree_color, g);
+          }
+        }
+      }
+
+      // ----- clear-zones — TIGHT, only behind the actual wordmark + line.
+      // Two small rectangles instead of one big one. Trees swaying near
+      // center keep their crowns; only the cells directly behind the
+      // text glyphs and the mood line get overdrawn.
+      it.filled_rectangle(110,  98, 100, 30, sky_bg);  // wordmark band
+      it.filled_rectangle(118, 145,  84,  8, sky_bg);  // line band
+
+      // NARADA wordmark breath — independent from heart period; uses a
+      // dedicated 4-second breath cycle (real respiration is slower than
+      // heart). Brightness modulates ±55 on the base text-bright color,
+      // big enough to actually read as the wordmark inhaling and exhaling.
+      float breath_phase = fmodf((float)now_ms, 4000.0f) / 4000.0f * 6.2831853f;
+      float breath = sinf(breath_phase);            // [-1, 1]
+      int   delta = (int)(breath * 55.0f);           // [-55, +55]
+      auto cclamp = [](int v) -> uint8_t {
+        if (v < 0)   return 0;
+        if (v > 255) return 255;
+        return (uint8_t)v;
+      };
+      Color narada_color(
+        cclamp(0xD4 + delta),
+        cclamp(0xCC + delta),
+        cclamp(0xB8 + delta)
+      );
+      it.print(160, 112, id(plex_mono_28), narada_color,
+               TextAlign::CENTER, "NARADA");
+
+      // Mood-tinted line under wordmark — length breathes a touch with
+      // the wordmark so the whole composition feels alive.
+      int line_extra = (int)(breath * 8.0f);
+      it.line(120 - line_extra, 148, 200 + line_extra, 148, tint);
+
+      // Presence indicator — flying saucer built from pixel primitives.
+      // The only ASCII glyph is `@` as the indicator centered on the
+      // dome. Modes:
+      //   0 (grey):    grey saucer (default per Suti's reference).
+      //   1 (mood):    saucer tinted with current mood color.
+      //   2 (outline): outline-only — no fills, just dome+disc rings.
+      if (id(attention_mode) != std::string("inward")) {
+        float ufo_t = fmodf((float)now_ms, 90000.0f) / 90000.0f;
+        int ufo_cx = (int)(ufo_t * (float)(COLS - 5)) + 3;
+        int ufo_y_top = (int)roundf(sinf((float)now_ms / 2200.0f) + 1.0f);
+        int ufo_y_bot = ufo_y_top + 1;
+        if (ufo_cx - 2 >= 0 && ufo_cx + 2 < COLS && ufo_y_bot < HORIZON_ROW) {
+          int mode = id(visual_ufo_mode);
+          // Default grey palette; mode 1 substitutes mood-tinted body.
+          Color dome_fill = (mode == 1)
+            ? Color((uint8_t)(tint.r * 0.7f),
+                    (uint8_t)(tint.g * 0.7f),
+                    (uint8_t)(tint.b * 0.7f))
+            : Color(0x88, 0x8C, 0x98);   // lighter grey dome
+          Color disc_fill = (mode == 1)
+            ? Color((uint8_t)(tint.r * 0.45f),
+                    (uint8_t)(tint.g * 0.45f),
+                    (uint8_t)(tint.b * 0.45f))
+            : Color(0x5A, 0x5E, 0x68);   // darker grey disc
+          Color glyph_at = (mode == 1) ? tint : Color(0xE0, 0xE4, 0xEA);
+
+          int body_cx = ufo_cx * CELL_W + CELL_W / 2;
+
+          // Three layers, drawn back-to-front:
+          //   1. Main disc — wide flat oval at the bottom
+          //   2. Mid disc — narrower oval bridging dome to main disc
+          //                  (fills the shoulder gap that was visible)
+          //   3. Dome    — circle on top
+          int disc_cy = ufo_y_bot * CELL_H + 4;
+          int disc_half_w = (5 * CELL_W) / 2;        // 17 px each side
+          int disc_half_h = 3;                        // 6 px tall total
+          int rect_x = body_cx - disc_half_w + disc_half_h;
+          int rect_w = (disc_half_w - disc_half_h) * 2;
+          int rect_y = disc_cy - disc_half_h;
+          int rect_h = disc_half_h * 2;
+          // Mid disc — sits at the row boundary, width between dome and
+          // main disc so it visually connects them.
+          int mid_cy = ufo_y_top * CELL_H + CELL_H + 1;
+          int mid_half_w = 13;
+          int mid_half_h = 3;
+          int mid_rect_x = body_cx - mid_half_w + mid_half_h;
+          int mid_rect_w = (mid_half_w - mid_half_h) * 2;
+          int mid_rect_y = mid_cy - mid_half_h;
+          int mid_rect_h = mid_half_h * 2;
+          int dome_cy = ufo_y_top * CELL_H + CELL_H - 4;
+          if (mode == 2) {
+            // Outline mode — rings only.
+            it.rectangle(rect_x, rect_y, rect_w, rect_h, disc_fill);
+            it.circle(body_cx - disc_half_w + disc_half_h, disc_cy,
+                      disc_half_h, disc_fill);
+            it.circle(body_cx + disc_half_w - disc_half_h, disc_cy,
+                      disc_half_h, disc_fill);
+            it.rectangle(mid_rect_x, mid_rect_y, mid_rect_w, mid_rect_h,
+                         dome_fill);
+            it.circle(body_cx - mid_half_w + mid_half_h, mid_cy,
+                      mid_half_h, dome_fill);
+            it.circle(body_cx + mid_half_w - mid_half_h, mid_cy,
+                      mid_half_h, dome_fill);
+            it.circle(body_cx, dome_cy, 9, dome_fill);
+          } else {
+            // Main disc (wide, dark)
+            it.filled_rectangle(rect_x, rect_y, rect_w, rect_h, disc_fill);
+            it.filled_circle(body_cx - disc_half_w + disc_half_h, disc_cy,
+                             disc_half_h, disc_fill);
+            it.filled_circle(body_cx + disc_half_w - disc_half_h, disc_cy,
+                             disc_half_h, disc_fill);
+            // Mid disc (medium, dome-color — bridges shoulder gap)
+            it.filled_rectangle(mid_rect_x, mid_rect_y, mid_rect_w,
+                                mid_rect_h, dome_fill);
+            it.filled_circle(body_cx - mid_half_w + mid_half_h, mid_cy,
+                             mid_half_h, dome_fill);
+            it.filled_circle(body_cx + mid_half_w - mid_half_h, mid_cy,
+                             mid_half_h, dome_fill);
+            // Dome (narrow, light)
+            it.filled_circle(body_cx, dome_cy, 9, dome_fill);
+          }
+
+          // @ indicator — the only glyph. Centered on the dome.
+          it.print(body_cx, dome_cy + 1, id(plex_mono_12),
+                   glyph_at, TextAlign::CENTER, "@");
+        }
+      }
+
+      // Cycle 2.25 — butterfly on calm sunlit days. Drifts horizontally
+      // low over the grass; wings flutter every ~140ms between glyph
+      // pairs. Drawn last so it passes in front of everything (wordmark,
+      // UFO, trees). Visible only when day + low wind + no rain + not
+      // attention=inward.
+      bool bf_calm = wind_kmh < 8.0f;
+      bool bf_dry  = precip_mmhr < 0.05f;
+      bool bf_visible = is_day && bf_calm && bf_dry &&
+                        id(attention_mode) != std::string("inward");
+      if (bf_visible) {
+        float bf_t  = fmodf((float)now_ms, 60000.0f) / 60000.0f;
+        float bf_cx = bf_t * (float)(COLS + 6) - 3.0f;
+        float bf_y  = 10.0f + sinf((float)now_ms / 1500.0f) * 0.6f;
+        int bf_y_int  = (int)roundf(bf_y);
+        int bf_cx_int = (int)roundf(bf_cx);
+        if (bf_cx_int >= 1 && bf_cx_int <= COLS - 2 &&
+            bf_y_int >= 8 && bf_y_int <= 11) {
+          int flutter = ((int)((float)now_ms / 140.0f)) & 1;
+          const char* wl;
+          const char* wr;
+          if (flutter) { wl = "("; wr = ")"; }
+          else         { wl = "\\"; wr = "/"; }
+          // Mood-tinted, slightly brighter so the butterfly carries the
+          // day's emotional accent without being garish.
+          float br_f = (float)tint.r * 1.15f;
+          float bg_f = (float)tint.g * 1.15f;
+          float bb_f = (float)tint.b * 1.15f;
+          if (br_f > 255.0f) br_f = 255.0f;
+          if (bg_f > 255.0f) bg_f = 255.0f;
+          if (bb_f > 255.0f) bb_f = 255.0f;
+          Color bf_color((uint8_t)br_f, (uint8_t)bg_f, (uint8_t)bb_f);
+          it.print((bf_cx_int - 1) * CELL_W, bf_y_int * CELL_H,
+                   id(plex_mono_12), bf_color, wl);
+          it.print(bf_cx_int * CELL_W, bf_y_int * CELL_H,
+                   id(plex_mono_12), bf_color, "o");
+          it.print((bf_cx_int + 1) * CELL_W, bf_y_int * CELL_H,
+                   id(plex_mono_12), bf_color, wr);
+        }
+      }
+
+      // backwards-compat: heartbeat_status_str / current_thought_str remain
+      // updated by the daemon but are intentionally not rendered.
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "WiFi SSID"
+
+  # --- backwards-compat proprioception (remove after Cycle 2) ---
+  - platform: template
+    name: "Current Status"
+    id: current_status_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(heartbeat_status_str);
+
+  - platform: template
+    name: "Current Thought"
+    id: current_thought_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(current_thought_str);
+
+  # --- v1.0 layer proprioception ---
+  # Every drawable property is also a text_sensor so any session can read the
+  # body's full state vector. The body is fully observable to itself.
+
+  - platform: template
+    name: "Mood Valence"
+    id: mood_valence_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(mood_valence));
+      return std::string(buf);
+
+  - platform: template
+    name: "Mood Arousal"
+    id: mood_arousal_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(mood_arousal));
+      return std::string(buf);
+
+  - platform: template
+    name: "Vitality Sleep Pressure"
+    id: vitality_sleep_pressure_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(vitality_sleep_pressure));
+      return std::string(buf);
+
+  - platform: template
+    name: "Vitality Restlessness"
+    id: vitality_restlessness_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(vitality_restlessness));
+      return std::string(buf);
+
+  - platform: template
+    name: "Vitality Warmth"
+    id: vitality_warmth_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(vitality_warmth));
+      return std::string(buf);
+
+  - platform: template
+    name: "Attention Mode"
+    id: attention_mode_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(attention_mode);
+
+  - platform: template
+    name: "Attention Target"
+    id: attention_target_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(attention_target);
+
+  - platform: template
+    name: "Attention Intensity"
+    id: attention_intensity_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.3f", id(attention_intensity));
+      return std::string(buf);
+
+  - platform: template
+    name: "Activity Mode"
+    id: activity_mode_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(activity_mode);
+
+  - platform: template
+    name: "Utterance Text"
+    id: utterance_text_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(utterance_text);
+
+  - platform: template
+    name: "Utterance Word Index"
+    id: utterance_word_index_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", id(utterance_word_index));
+      return std::string(buf);
+
+  - platform: template
+    name: "Utterance Total Words"
+    id: utterance_total_words_sensor
+    update_interval: 30s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", id(utterance_total_words));
+      return std::string(buf);
+
+  - platform: template
+    name: "Signal Kind"
+    id: signal_kind_sensor
+    update_interval: 30s
+    lambda: |-
+      return id(signal_kind);
+
+  - platform: template
+    name: "Signal Remaining Ms"
+    id: signal_remaining_ms_sensor
+    update_interval: 500ms
+    lambda: |-
+      char buf[16];
+      uint32_t until = id(signal_until_ms);
+      if (until == 0) {
+        return std::string(id(signal_kind) == std::string("none") ? "0" : "persistent");
+      }
+      int32_t remaining = (int32_t)(until - millis());
+      if (remaining < 0) remaining = 0;
+      snprintf(buf, sizeof(buf), "%d", remaining);
+      return std::string(buf);
+
+  # --- v1.0 weather proprioception ---
+  - platform: template
+    name: "Weather Wind Speed Kmh"
+    id: weather_wind_speed_kmh_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.1f", id(weather_wind_speed_kmh));
+      return std::string(buf);
+
+  - platform: template
+    name: "Weather Wind Direction Deg"
+    id: weather_wind_direction_deg_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.1f", id(weather_wind_direction_deg));
+      return std::string(buf);
+
+  - platform: template
+    name: "Weather Precipitation Mm Hr"
+    id: weather_precipitation_mm_hr_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.2f", id(weather_precipitation_mm_hr));
+      return std::string(buf);
+
+  - platform: template
+    name: "Weather Cloud Cover Pct"
+    id: weather_cloud_cover_pct_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.0f", id(weather_cloud_cover_pct));
+      return std::string(buf);
+
+  - platform: template
+    name: "Weather Code"
+    id: weather_code_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", id(weather_code));
+      return std::string(buf);
+
+  - platform: template
+    name: "Weather Temperature C"
+    id: weather_temperature_c_sensor
+    update_interval: 5s
+    lambda: |-
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%.1f", id(weather_temperature_c));
+      return std::string(buf);
+
+  # --- v1.0 visual preferences proprioception ---
+  - platform: template
+    name: "Visual Tree Species"
+    id: visual_tree_species_sensor
+    update_interval: 5s
+    lambda: |-
+      int v = id(visual_tree_species);
+      return std::string(v == 0 ? "pine" : v == 1 ? "oak" : v == 2 ? "mixed" : "?");
+
+  - platform: template
+    name: "Visual UFO Mode"
+    id: visual_ufo_mode_sensor
+    update_interval: 5s
+    lambda: |-
+      int v = id(visual_ufo_mode);
+      return std::string(v == 0 ? "grey" : v == 1 ? "mood" : v == 2 ? "outline" : "?");
+
+font:
+  # Local IBM Plex Mono TTFs (extracted to embodiment/assets/fonts/). Glyph
+  # vocabulary is constrained to ASCII because the upstream font does NOT
+  # carry block elements / box drawing / geometric shapes — gfonts was
+  # silently substituting tofu for those, which we noticed during Cycle
+  # 2.6 prep. ASCII-only is also the more honest aesthetic.
+  - file: "../assets/fonts/IBMPlexMono-Regular.ttf"
+    id: plex_mono_12
+    size: 12
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+
+  - file: "../assets/fonts/IBMPlexMono-Medium.ttf"
+    id: plex_mono_28
+    size: 28
+    glyphs: "ADNR"
+
+  # Cycle 4.1 — 16px live STT transcript band above Narada's head.
+  # Two rows of red text on a white background. Same ASCII glyph set
+  # as plex_mono_12.
+  - file: "../assets/fonts/IBMPlexMono-Regular.ttf"
+    id: plex_mono_16
+    size: 16
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"

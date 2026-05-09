@@ -1,0 +1,301 @@
+# narada-sprite-test.yaml
+#
+# Phase 1 of the embodiment scenes/sprites work. Bare-bones firmware
+# that exercises the sprite blit pipeline with placeholder data and
+# instruments frame timing, so we can validate ≥30fps on the BOX-3
+# before commissioning real character art.
+#
+# Plan: docs/plans/embodiment-scenes-and-sprites-2026-05-02.md
+# Sprites: scripts/gen_test_sprites.py → include/test_sprites.h
+#
+# Test scenarios (toggle via API services, captured on serial):
+#   A: sprites only on solid bg
+#   B: sprites on a host-pushed bhumi (TCP :6060, same path narada-body uses)
+#   C: full composite — bg + body + 2 eyes + mouth + speech bubble overlay
+#   D: sandhi swap — full-screen frames pushed at 30fps mid-test, time the swap
+#
+# What gets logged every 30 frames (at scenario rate):
+#   - microseconds per frame (lambda body)
+#   - microseconds per flush (component.update)
+#   - free internal heap, free DMA-capable heap, free largest internal block
+#   - dirty-rect size for that frame
+#
+# Note: the ili9xxx driver in ESPHome already tracks dirty rects per
+# pixel-write and flushes via a single DMA SPI transaction (write_array)
+# of the dirty rows. We are NOT adding DMA — we are measuring how the
+# existing dirty-region flush behaves under sprite workloads.
+
+substitutions:
+  name: narada-sprite-test
+  friendly_name: Narada Sprite Test
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.3.0
+  includes:
+    - include/test_sprites.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          ESP_LOGI("sprite", "test sprites loaded: %d frames at %dx%d each",
+                   TEST_SPRITE_COUNT, TEST_SPRITE_SIZE, TEST_SPRITE_SIZE);
+      - script.execute: alloc_bhumi
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+mdns:
+  disabled: true
+
+# Enable OTA flashing — saves the COM3-handoff dance during Phase 1
+# iteration. No password: this firmware exists for one purpose and only
+# runs on Suti's bench.
+ota:
+  - platform: esphome
+
+api:
+  services:
+    # Switch active scenario at runtime so we can sweep without
+    # reflashing. After calling, the next 30-frame stats batch will
+    # reflect the new scenario.
+    - service: set_scenario
+      variables:
+        s: int   # 0=A solid bg, 1=B host bhumi, 2=C full composite, 3=D sandhi
+      then:
+        - lambda: |-
+            id(scenario) = s;
+            ESP_LOGI("sprite", "scenario set to %d", s);
+    - service: trigger_sandhi
+      then:
+        - lambda: |-
+            id(sandhi_active) = true;
+            id(sandhi_frame) = 0;
+            id(sandhi_start_us) = (uint64_t) micros();
+            ESP_LOGI("sprite", "sandhi triggered");
+
+globals:
+  - id: scenario
+    type: int
+    restore_value: false
+    initial_value: '2'   # default to scenario C (full composite, the headline target)
+  - id: frame_index
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: frame_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: lambda_us_total
+    type: uint64_t
+    restore_value: false
+    initial_value: '0'
+  - id: sandhi_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: sandhi_frame
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: sandhi_start_us
+    type: uint64_t
+    restore_value: false
+    initial_value: '0'
+  # Bhumi buffer for scenario B — pushed from host over TCP :6060.
+  # Same shape as narada-body's remote_frame_buffer (320x240 RGB565).
+  - id: bhumi_buffer
+    type: uint8_t*
+    restore_value: false
+    initial_value: 'nullptr'
+  - id: bhumi_active
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+# Allocate the bhumi buffer in PSRAM at boot so scenario B can blit
+# from it. Same allocation pattern as narada-body's remote_frame_buffer.
+# The TCP listener for pushing into it is omitted from this test
+# firmware — for scenario B, fill the buffer with a static pattern.
+script:
+  - id: alloc_bhumi
+    then:
+      - lambda: |-
+          // Idempotent: skip if buffer already exists. Earlier version
+          // leaked 150 KB of PSRAM per call because the on-boot interval
+          // didn't gate properly.
+          if (id(bhumi_buffer) != nullptr) return;
+          static const uint32_t FRAME_BYTES = 320u * 240u * 2u;
+          id(bhumi_buffer) = (uint8_t*) heap_caps_malloc(
+              FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (id(bhumi_buffer) == nullptr) {
+            ESP_LOGE("sprite", "bhumi buffer alloc failed");
+            return;
+          }
+          // Static gradient pattern so we know it's there visually.
+          for (uint32_t i = 0; i < FRAME_BYTES; i += 2) {
+            uint8_t y = (i / 2) / 320;
+            uint16_t c = ((y >> 3) << 11) | ((y >> 2) << 5) | (y >> 3);
+            id(bhumi_buffer)[i] = (uint8_t)(c >> 8);
+            id(bhumi_buffer)[i + 1] = (uint8_t) c;
+          }
+          ESP_LOGI("sprite", "bhumi buffer allocated and filled (%u bytes)",
+                   (unsigned) FRAME_BYTES);
+
+spi:
+  clk_pin: 7
+  mosi_pin: 6
+
+display:
+  - platform: ili9xxx
+    id: narada_display
+    model: S3BOX
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    invert_colors: false
+    # 30 fps target — every 33ms the lambda runs and the dirty rows flush.
+    update_interval: 33ms
+    lambda: |-
+      // -------------------------------------------------------------
+      // Phase 1 sprite perf test
+      // Scenarios:
+      //   0=A solid bg   1=B host bhumi   2=C full composite
+      //   3=D sandhi (full-screen swap mid-test)
+      // -------------------------------------------------------------
+      uint32_t t_lambda_start = micros();
+      const auto blit_sprite = [&](int sx, int sy, int sprite_idx) {
+        // Blit a 32x32 RGB565 sprite from the test_sprites table into
+        // the display buffer at (sx, sy). draw_pixel_at sets one pixel
+        // and updates the driver's dirty-rect tracker; the periodic
+        // update() call flushes dirty rows via DMA SPI write_array.
+        int idx = sprite_idx % TEST_SPRITE_COUNT;
+        for (int dy = 0; dy < TEST_SPRITE_SIZE; dy++) {
+          for (int dx = 0; dx < TEST_SPRITE_SIZE; dx++) {
+            uint16_t c = test_sprites[idx][dy * TEST_SPRITE_SIZE + dx];
+            uint8_t r = ((c >> 11) & 0x1F) << 3;
+            uint8_t g = ((c >> 5) & 0x3F) << 2;
+            uint8_t b = (c & 0x1F) << 3;
+            it.draw_pixel_at(sx + dx, sy + dy, Color(r, g, b));
+          }
+        }
+      };
+
+      int s = id(scenario);
+
+      if (id(sandhi_active)) {
+        // Scenario D: full-screen frame swap. Fill display with
+        // sprite[sandhi_frame % 8] tiled — exercises the full-screen
+        // dirty path (worst case for SPI bandwidth).
+        int sf = id(sandhi_frame) % TEST_SPRITE_COUNT;
+        for (int y = 0; y < 240; y += TEST_SPRITE_SIZE) {
+          for (int x = 0; x < 320; x += TEST_SPRITE_SIZE) {
+            blit_sprite(x, y, sf);
+          }
+        }
+        id(sandhi_frame) = id(sandhi_frame) + 1;
+        if (id(sandhi_frame) >= 60) {
+          uint64_t elapsed = (uint64_t) micros() - id(sandhi_start_us);
+          ESP_LOGI("sprite", "sandhi finished: 60 frames in %llu us (%.1f fps)",
+                   (unsigned long long) elapsed, 60.0f * 1000000.0f / (float) elapsed);
+          id(sandhi_active) = false;
+        }
+      } else if (s == 0) {
+        // A: solid bg + 2 eyes + mouth + body
+        it.fill(Color(0, 0, 0));
+        blit_sprite(120, 80, 0);   // left eye
+        blit_sprite(170, 80, 1);   // right eye
+        blit_sprite(140, 130, 2);  // mouth
+        blit_sprite(140, 170, id(frame_index) % 4 + 3);  // body cycle
+      } else if (s == 1) {
+        // B: blit bhumi buffer as bg, then sprites
+        if (id(bhumi_buffer) != nullptr) {
+          const uint8_t *buf = id(bhumi_buffer);
+          for (int y = 0; y < 240; y++) {
+            for (int x = 0; x < 320; x++) {
+              uint32_t i = (uint32_t)(y * 320 + x) * 2u;
+              uint16_t c = ((uint16_t) buf[i] << 8) | buf[i + 1];
+              uint8_t r = ((c >> 11) & 0x1F) << 3;
+              uint8_t g = ((c >> 5) & 0x3F) << 2;
+              uint8_t b = (c & 0x1F) << 3;
+              it.draw_pixel_at(x, y, Color(r, g, b));
+            }
+          }
+        } else {
+          it.fill(Color(0, 0, 0));
+        }
+        blit_sprite(120, 80, 0);
+        blit_sprite(170, 80, 1);
+        blit_sprite(140, 130, 2);
+        blit_sprite(140, 170, id(frame_index) % 4 + 3);
+      } else if (s == 2) {
+        // C: full composite — bg fill + body + 2 eyes + mouth + speech bubble
+        it.fill(Color(20, 20, 30));
+        blit_sprite(140, 170, id(frame_index) % 4 + 3);  // body
+        blit_sprite(120, 80, 0);   // left eye
+        blit_sprite(170, 80, 1);   // right eye
+        // Mouth animates per frame (simulates phoneme rate).
+        blit_sprite(140, 130, 2 + ((id(frame_index) / 3) % 3));
+        // Speech bubble — bigger, pinned top
+        for (int y = 5; y < 35; y++) {
+          for (int x = 220; x < 315; x++) {
+            it.draw_pixel_at(x, y, Color(240, 240, 240));
+          }
+        }
+        blit_sprite(225, 8, 7);  // bubble decoration sprite
+      } else {
+        it.fill(Color(50, 0, 0));
+      }
+
+      uint32_t t_lambda_end = micros();
+      uint32_t lambda_us = t_lambda_end - t_lambda_start;  // wraparound-safe
+      id(lambda_us_total) = id(lambda_us_total) + (uint64_t) lambda_us;
+      id(frame_count) = id(frame_count) + 1;
+      id(frame_index) = id(frame_index) + 1;
+
+      if (id(frame_count) >= 30) {
+        uint64_t avg = id(lambda_us_total) / 30u;
+        // Free heap stats — internal vs DMA-capable vs largest contiguous.
+        size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        ESP_LOGI("sprite",
+                 "scenario=%d frames=%d avg_lambda_us=%llu (effective %.1f fps if iso) "
+                 "free_int=%u free_dma=%u largest_int=%u",
+                 s, id(frame_count),
+                 (unsigned long long) avg,
+                 1000000.0f / (float) avg,
+                 (unsigned) free_internal,
+                 (unsigned) free_dma,
+                 (unsigned) largest_internal);
+        id(frame_count) = 0;
+        id(lambda_us_total) = 0;
+      }

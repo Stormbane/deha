@@ -1,0 +1,299 @@
+# narada-voice-test.yaml
+# Minimal voice-only firmware for ESP32-S3-BOX-3. Strips display/scene
+# entirely so we can validate the audio path (mic + speaker + wake word
+# + voice_assistant) in isolation. Once the round-trip works, the audio
+# block here gets folded into narada-body.yaml.
+#
+# Lifted from esphome/wake-word-voice-assistants/esp32-s3-box-3 (canonical
+# reference). Key differences from our previous attempt: framework is
+# esp-idf (required for voice_assistant + micro_wake_word), audio_dac
+# sample_rate is 48000 (not 16000), media_player wraps the speaker, and
+# the voice_assistant component manages mic↔speaker bus contention
+# internally.
+
+substitutions:
+  name: narada-voice
+  friendly_name: Narada Voice
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.3.0
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      # Push read-only data and instruction fetches to PSRAM so internal
+      # RAM is free for micro_wake_word's tensor arena. voice-pe sets
+      # both — without them mWW alloc fails on the BOX-3.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      # Push BT and mbedtls (TLS) buffers to PSRAM. mbedtls in particular
+      # eats a chunk of internal DRAM that mWW needs. voice-pe sets all
+      # of these to keep internal RAM free for the tensor arena.
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      # Override ESPHome's auto-applied "PSRAM optimized" WiFi buffer
+      # counts. ESPHome bumps RX/TX to 64 each when PSRAM is detected,
+      # but the buffers must live in DMA-capable internal RAM, not
+      # PSRAM. At ~1.6KB per RX buffer, 64 = ~100KB internal RAM gone
+      # before mWW tries to allocate. Cutting to 10/16/16 frees ~75KB
+      # of internal DRAM. mWW needs only ~7.7KB more for its second
+      # tensor-arena resize.
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "10"
+      CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM: "16"
+      CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM: "16"
+      # WIFI_RX_BA_WIN must be <= DYNAMIC_RX_BUFFER_NUM and <= 2x
+      # STATIC_RX_BUFFER_NUM (esp-idf wifi_init.c compile check). With
+      # buffers cut to 10/16, BA window must be <= 16. ESP-IDF default
+      # of 6 fits and is fine for our low-bandwidth API traffic.
+      CONFIG_ESP_WIFI_RX_BA_WIN: "6"
+      CONFIG_LWIP_TCP_RECVMBOX_SIZE: "16"
+      CONFIG_LWIP_UDP_RECVMBOX_SIZE: "8"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Disable power save mode; saves a couple KB of internal RAM and
+  # also reduces wake_word inference latency under WiFi traffic.
+  power_save_mode: none
+
+# Removed `ap:` and `captive_portal:` — they each allocate internal RAM
+# (HTTP server + state machine) and we don't need them now that WiFi is
+# configured. Re-add for first-time setup of a fresh device.
+
+# mDNS disabled to free ~4-6KB of internal RAM for mWW. The bridge
+# connects by IP (192.168.86.35), not hostname, so we don't need
+# .local resolution. Re-enable if anything needs hostname discovery.
+mdns:
+  disabled: true
+
+api:
+  services:
+    - service: trigger_listen
+      then:
+        - logger.log: "trigger_listen — starting voice_assistant"
+        - voice_assistant.start:
+            # Explicit wake_word so the bridge doesn't gate as phantom.
+            wake_word: "trigger"
+
+# Removed `ota:` and `safe_mode:` blocks — together ~5KB internal RAM.
+# OTA over the API works without the OTA component (esphome run does
+# wireless uploads via the API path). Safe mode's 5-min watchdog task
+# pins ~3KB. Re-add both before deploying to a remote device.
+
+i2c:
+  - id: i2c_adc_dac
+    scl: GPIO18
+    sda: GPIO8
+    scan: false
+
+# Display + SPI + touchscreen STRIPPED to free ~150KB internal RAM for
+# mWW's tensor arena. The display framebuffer (320×240×16 = 154KB) is
+# DMA-allocated from internal RAM regardless of `update_interval: never`.
+# Touch-to-talk is gone with it (touchscreen DEPENDENCIES = ["display"]).
+# Inputs available now:
+#   - on-device mWW ("okay nabu") — primary
+#   - api.services.trigger_listen — manual fallback if mWW misbehaves
+# Display + touch return when this folds into narada-body.yaml (Phase 2).
+
+i2s_audio:
+  - id: i2s_audio_bus
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+# Speaker power amplifier enable. Without this the DAC clocks audio
+# fine but the amp feeding the physical speaker driver stays off, so
+# the box is silent. RESTORE_DEFAULT_ON keeps it enabled across boots.
+switch:
+  - platform: gpio
+    name: Speaker Enable
+    pin:
+      number: GPIO46
+      ignore_strapping_warning: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+audio_adc:
+  - platform: es7210
+    i2c_id: i2c_adc_dac
+    id: es7210_adc
+    bits_per_sample: 16bit
+    sample_rate: 16000
+
+audio_dac:
+  - platform: es8311
+    i2c_id: i2c_adc_dac
+    id: es8311_dac
+    bits_per_sample: 16bit
+    sample_rate: 48000
+
+microphone:
+  - platform: i2s_audio
+    id: box_mic
+    sample_rate: 16000
+    i2s_din_pin: GPIO16
+    bits_per_sample: 16bit
+    adc_type: external
+
+speaker:
+  - platform: i2s_audio
+    id: box_speaker
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    channel: left
+    audio_dac: es8311_dac
+    # Default 500ms × 48kHz × 2 bytes = 48KB DMA in internal RAM —
+    # exactly what mWW's tensor arena was missing. voice-pe uses 100ms
+    # (home-assistant-voice.yaml:1542). At 50ms × 48kHz × 2 = 4.8KB
+    # which buys us ~4.8KB of internal RAM headroom for mWW. The
+    # streaming TTS path can underrun briefly at 50ms but the
+    # announcement_pipeline buffers ahead of the DMA.
+    buffer_duration: 50ms
+
+# Wraps box_speaker as a media_player. voice_assistant in media_player
+# mode routes TTS through the announcement_pipeline, which calls
+# set_audio_stream_info on the underlying speaker (the legacy
+# `speaker:` mode never did this — see findings 2026-05-01 #3). FLAC
+# at 48k mono lets the announcement_pipeline resample on the device.
+media_player:
+  - platform: speaker
+    id: box_media_player
+    announcement_pipeline:
+      speaker: box_speaker
+      format: FLAC
+      sample_rate: 48000
+      num_channels: 1
+
+# On-device wake word. Three differences from earlier attempts:
+# (1) explicit microphone source with gain_factor 4 — required by the
+# modern mWW schema; (2) vad: enabled inside mWW so inference skips on
+# silence (saves ~60% of one core); (3) stop_after_detection: false so
+# mWW keeps listening through TTS playback (enables interrupt phrases
+# like "stop"). Tensor alloc requires CONFIG_SPIRAM_RODATA above.
+micro_wake_word:
+  id: mww
+  microphone:
+    microphone: box_mic
+    # box_mic is mono — only channel index 0 exists. (voice-pe's mic
+    # is stereo so they use channels: 1 to pull the right channel.)
+    channels: 0
+    gain_factor: 4
+  # `false` keeps mWW listening through TTS playback (would enable
+  # interrupt phrases like "stop") — but the BOX-3's mic and speaker
+  # share the same I2S bus, and mWW holding the mic blocks the
+  # speaker from claiming it: TTS fails with "Parent I2S bus not free".
+  # Setting `true` (the default; what voice-pe uses) lets mWW release
+  # the mic when the wake word fires, voice_assistant takes over, then
+  # on_end re-arms mWW for the next turn. Loses interrupt phrases but
+  # the audio path actually works.
+  stop_after_detection: true
+  vad:
+  models:
+    # Pinned to the V1 model. The bundled `okay_nabu` shorthand resolves
+    # to the V2 manifest at .../models/v2/okay_nabu.json — that V2 model
+    # fails tensor allocation on ESP32-S3-Box-3 with PSRAM regardless of
+    # arena size, because TFLite's allocator does not place V2's arena
+    # in PSRAM. Symptom: "Failed to resize buffer. Requested: 19472,
+    # available 11876" — byte-identical across all arena tunings.
+    # See https://github.com/esphome/esphome/issues/15603.
+    # The `@main` ref pins to a specific git revision; URL form below
+    # also works but the github:// form gives us version control.
+    # V2 models all use feature_step_size=10 (V1 uses 20, can't mix).
+    # With esp-nn pinned to 1.2.0~1 (see micro_wake_word/__init__.py),
+    # V2 alloc works fine. Two wake words enabled — try whichever
+    # fires more reliably.
+    - model: github://esphome/micro-wake-word-models/models/v2/okay_nabu.json@main
+      id: okay_nabu_v2
+      probability_cutoff: 0.56
+    - model: github://esphome/micro-wake-word-models/models/v2/hey_jarvis.json@main
+      id: hey_jarvis_v2
+      probability_cutoff: 0.56
+  on_wake_word_detected:
+    - logger.log:
+        format: "mww FIRED: %s"
+        args: ['wake_word.c_str()']
+    - voice_assistant.start:
+        wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: va
+  microphone: box_mic
+  media_player: box_media_player
+  micro_wake_word: mww
+  # Explicit so the device doesn't ask HA to run streaming wake word
+  # (which is what was producing the 8s phantom turns).
+  use_wake_word: false
+  noise_suppression_level: 2
+  auto_gain: 31dBFS
+  volume_multiplier: 2.0
+  # Lifecycle logs — these print as `[main:LINE]` lines so we can
+  # diagnose without device-side voice_assistant DEBUG logs.
+  on_client_connected:
+    - logger.log: "va: client_connected (pipeline subscribed)"
+    # Start mWW when the API client connects. Without this, mWW boots
+    # in STOPPED state and never runs inference — saying "okay nabu"
+    # produces nothing. voice-pe does this on on_client_connected
+    # (home-assistant-voice.yaml:1817) and so does the box-3 reference.
+    - micro_wake_word.start:
+  on_client_disconnected:
+    - logger.log: "va: client_disconnected"
+    - micro_wake_word.stop:
+  on_start:
+    - logger.log: "va: on_start"
+  on_listening:
+    - logger.log: "va: on_listening (mic streaming)"
+  on_stt_vad_start:
+    - logger.log: "va: stt_vad_start"
+  on_stt_vad_end:
+    - logger.log: "va: stt_vad_end"
+  on_stt_end:
+    - logger.log:
+        format: "va: stt_end text=%s"
+        args: ['x.c_str()']
+  on_intent_start:
+    - logger.log: "va: intent_start"
+  on_intent_end:
+    - logger.log: "va: intent_end"
+  on_tts_start:
+    - logger.log:
+        format: "va: tts_start text=%s"
+        args: ['x.c_str()']
+  # on_tts_stream_start / on_tts_stream_end are not allowed in
+  # media_player mode (they require legacy `speaker:`). The bridge
+  # still sends those events when streaming-TTS is enabled — the
+  # device routes the audio internally via the announcement_pipeline.
+  on_tts_end:
+    - logger.log: "va: tts_end"
+  on_end:
+    - logger.log: "va: on_end (back to idle)"
+    # voice_assistant.start auto-stops mWW when a turn begins; restart
+    # it here so the next wake word can fire. Mirrors voice-pe's
+    # on_end pattern (esp32-s3-box-3.yaml:286).
+    - micro_wake_word.start:
+  on_error:
+    - logger.log:
+        format: "va: ERROR code=%s message=%s"
+        args: ['code.c_str()', 'message.c_str()']

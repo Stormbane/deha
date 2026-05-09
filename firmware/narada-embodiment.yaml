@@ -1,0 +1,197 @@
+# narada-embodiment.yaml
+#
+# Phase 2 of the embodiment scenes/sprites work — first firmware that
+# uses the layer compositor + atlas format. The state machine and
+# bridge integration come in the next commits; for now, layers are set
+# via API services so we can drive scenes by hand and watch the
+# compositor respond.
+#
+# Phase 1 (perf reference): embodiment/firmware/narada-sprite-test.yaml
+# Design doc: docs/plans/embodiment-phase2-design-2026-05-02.md
+# Atlas: embodiment/sprites/test_atlas/ → include/atlas_test_atlas.h
+# Compositor: include/compositor.h
+#
+# API surface (everything is "set this layer to this frame"):
+#   - set_face(eye_l, eye_r, mouth, body)  // most common: snap a face
+#   - set_layer(layer, frame, x, y)        // direct poke for testing
+#   - set_mood(mood)                       // 0=neutral, 1=curious, 2=focused
+#   - set_glyph(visible, x, y)
+#   - clear_face()                         // hide everything
+#
+# Default boot lands a "neutral face" so we can confirm the path is
+# alive without sending any commands.
+
+substitutions:
+  name: narada-embodiment
+  friendly_name: Narada Embodiment
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.3.0
+  includes:
+    - include/atlas_test_atlas.h
+    - include/compositor.h
+    - include/state_machine.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          using namespace narada;
+          comp().set_atlas(test_atlas_frames, test_atlas_pixels, TA_FRAME_COUNT);
+          comp().set_bg_color(0x18C3);  // ~Color(20, 20, 30) in RGB565
+          // State machine pushes the default state (neutral, not
+          // speaking, gaze centered, no glyph) into the compositor.
+          sm().apply_all();
+          ESP_LOGI("comp", "boot scene staged via state machine");
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+mdns:
+  disabled: true
+
+ota:
+  - platform: esphome
+
+api:
+  services:
+    # ---- High-level (state-machine) API — preferred for the bridge ----
+    - service: set_mood
+      variables:
+        mood: int    # 0=neutral, 1=curious, 2=focused
+        snap: bool   # true = skip through-neutral animation
+      then:
+        - lambda: |-
+            using namespace narada;
+            sm().set_mood((Mood) mood, snap);
+            ESP_LOGI("sm", "mood=%d snap=%d", mood, (int) snap);
+    - service: set_speaking
+      variables:
+        speaking: bool
+      then:
+        - lambda: |-
+            using namespace narada;
+            sm().set_speaking(speaking);
+            ESP_LOGD("sm", "speaking=%d", (int) speaking);
+    - service: set_phoneme
+      variables:
+        phoneme: int   # 0=rest, 1=AA, 2=EE, 3=OH, 4=MBP
+      then:
+        - lambda: |-
+            using namespace narada;
+            sm().set_phoneme((Phoneme) phoneme);
+            // No log per phoneme — too chatty during speech.
+    - service: set_gaze
+      variables:
+        gx: float   # -1.0 .. +1.0
+        gy: float
+      then:
+        - lambda: |-
+            using namespace narada;
+            sm().set_gaze(gx, gy);
+    - service: set_glyph
+      variables:
+        visible: bool
+        x: int
+        y: int
+      then:
+        - lambda: |-
+            using namespace narada;
+            sm().set_glyph_visible(visible, (int16_t) x, (int16_t) y);
+            ESP_LOGI("sm", "glyph=%d at (%d,%d)", (int) visible, x, y);
+
+    # ---- Low-level (direct compositor) API — testing / debug only ----
+    - service: set_layer
+      variables:
+        layer: int
+        frame: int
+        x: int
+        y: int
+      then:
+        - lambda: |-
+            using namespace narada;
+            comp().set_layer((LayerId) layer, (uint16_t) frame, (int16_t) x, (int16_t) y);
+            ESP_LOGI("comp", "set_layer: id=%d frame=%d at (%d,%d)", layer, frame, x, y);
+    - service: clear_face
+      then:
+        - lambda: |-
+            using namespace narada;
+            for (uint8_t i = 0; i < LAYER_COUNT; i++) comp().clear_layer((LayerId) i);
+            ESP_LOGI("comp", "cleared all layers");
+
+# Per-frame perf counters. The Compositor itself is a Meyer's
+# singleton in compositor.h — see narada::comp() — because ESPHome's
+# globals block can't hold a non-trivial type whose declaration
+# resolves before the user includes are processed.
+globals:
+  - id: frame_count
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: lambda_us_total
+    type: uint64_t
+    restore_value: false
+    initial_value: '0'
+
+spi:
+  clk_pin: 7
+  mosi_pin: 6
+
+display:
+  - platform: ili9xxx
+    id: narada_display
+    model: S3BOX
+    cs_pin: 5
+    dc_pin: 4
+    reset_pin:
+      number: 48
+      inverted: true
+    invert_colors: false
+    update_interval: 33ms
+    lambda: |-
+      uint32_t t0 = micros();
+      narada::sm().tick(t0);
+      narada::comp().render(it);
+      uint32_t t1 = micros();
+      id(lambda_us_total) = id(lambda_us_total) + (uint64_t)(t1 - t0);
+      id(frame_count) = id(frame_count) + 1;
+      if (id(frame_count) >= 30) {
+        uint64_t avg = id(lambda_us_total) / 30u;
+        size_t free_int = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        size_t free_dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        ESP_LOGI("comp",
+                 "frames=%d avg_lambda_us=%llu (%.1f fps) "
+                 "free_int=%u free_dma=%u largest_int=%u",
+                 id(frame_count), (unsigned long long) avg,
+                 1000000.0f / (float) avg,
+                 (unsigned) free_int, (unsigned) free_dma,
+                 (unsigned) largest);
+        id(frame_count) = 0;
+        id(lambda_us_total) = 0;
+      }
