@@ -1,0 +1,116 @@
+{
+  "name": "test_atlas",
+  "version": 1,
+  "anchor": "center",
+  "enum_prefix": "TA",
+  "frames": [
+    {
+      "name": "eye_left",
+      "file": "eye_left.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "eye_right",
+      "file": "eye_right.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mouth_rest",
+      "file": "mouth_rest.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "body_idle",
+      "file": "body_idle.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mouth_aa",
+      "file": "mouth_aa.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mouth_ee",
+      "file": "mouth_ee.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mouth_oh",
+      "file": "mouth_oh.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mouth_mbp",
+      "file": "mouth_mbp.png",
+      "ox": -16,
+      "oy": -16
+    },
+    {
+      "name": "mood_neutral",
+      "file": "mood_neutral.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_curious",
+      "file": "mood_curious.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_focused",
+      "file": "mood_focused.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_curious_t1",
+      "file": "mood_curious_t1.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_curious_t2",
+      "file": "mood_curious_t2.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_curious_t3",
+      "file": "mood_curious_t3.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_focused_t1",
+      "file": "mood_focused_t1.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_focused_t2",
+      "file": "mood_focused_t2.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "mood_focused_t3",
+      "file": "mood_focused_t3.png",
+      "ox": -24,
+      "oy": -24
+    },
+    {
+      "name": "glyph_dot",
+      "file": "glyph_dot.png",
+      "ox": -8,
+      "oy": -8
+    }
+  ]
+}
