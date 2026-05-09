@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deha"
+version = "0.1.0"
+description = "The body — ESP32-S3-BOX-3 firmware, voice brain server, and the deha_client lib for talking to it"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Sutirtha Basak", email = "sutirthabasak@gmail.com" },
+    { name = "Narada", email = "narada@fractal.co.nz" },
+]
+keywords = ["esp32", "voice", "embodiment", "narada", "ai-agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "requests>=2.31",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+voice = [
+    # Voice / TTS / Wyoming dependencies
+    "wyoming>=1.5",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.urls]
+Repository = "https://github.com/Stormbane/deha"
+Issues = "https://github.com/Stormbane/deha/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
