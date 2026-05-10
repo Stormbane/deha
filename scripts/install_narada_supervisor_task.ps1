@@ -13,7 +13,7 @@
 param(
     [switch]$Uninstall,
     [switch]$RunNow,
-    [string]$Voice = "bm_george",
+    [string]$Voice = "am_michael:0.5,af_heart:0.5",
     [string]$Model = "sonnet"
 )
 

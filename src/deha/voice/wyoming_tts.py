@@ -87,6 +87,8 @@ class KokoroTtsHandler(AsyncEventHandler):
             await self.write_event(
                 AudioStart(rate=sr, width=width, channels=channels).event()
             )
+            first_chunk_logged = False
+            chunk_count = 0
             try:
                 async for pcm in self.tts.stream_text(text):
                     for frame in _split_pcm(pcm, frame_bytes):
@@ -98,8 +100,13 @@ class KokoroTtsHandler(AsyncEventHandler):
                                 audio=frame,
                             ).event()
                         )
+                        chunk_count += 1
+                        if not first_chunk_logged:
+                            _LOG.info("first_chunk voice=%s", voice_name)
+                            first_chunk_logged = True
             finally:
                 await self.write_event(AudioStop().event())
+                _LOG.info("synth_done voice=%s chunks=%d", voice_name, chunk_count)
             return True
 
         return True

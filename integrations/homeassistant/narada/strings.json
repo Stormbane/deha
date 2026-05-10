@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Narada brain",
+        "description": "URL of the Narada brain HTTP server running on the host.",
+        "data": {
+          "brain_url": "Brain URL"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Narada is already configured"
+    }
+  }
+}

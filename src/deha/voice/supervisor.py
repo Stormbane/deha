@@ -108,11 +108,18 @@ class Component:
     name: str
     check: Callable[[], Awaitable[bool]]
     restart: Callable[[], Awaitable[None]]
+    # Per-component post-restart grace: HA needs ~60s to start serving
+    # /manifest.json after `docker start`; brain_server is up in seconds.
+    # During this window, failed checks are logged as "warming" rather
+    # than counting toward another restart, so we don't loop while the
+    # component is still booting.
+    restart_grace_s: float = 0.0
     last_status: str = "unknown"
     last_check_at: float = 0.0
     consecutive_failures: int = 0
     restart_count: int = 0
     last_restart_at: float = 0.0
+    restart_grace_until: float = 0.0
     backoff_index: int = 0
 
     def to_status(self) -> dict:
@@ -344,6 +351,7 @@ class Supervisor:
                     _LOG.info("initial bring-up: %s is down — starting", c.name)
                     await c.restart()
                     c.last_restart_at = time.time()
+                    c.restart_grace_until = c.last_restart_at + c.restart_grace_s
                     c.restart_count += 1
             except Exception:
                 _LOG.exception("initial bring-up failed for %s", c.name)
@@ -380,6 +388,13 @@ class Supervisor:
                 _LOG.info("%s: still warming (in grace, %.0fs left)",
                           c.name, STARTUP_GRACE_S - (now - self._started_at))
                 continue
+            if now < c.restart_grace_until:
+                # Just restarted this component; let it finish booting
+                # before counting failures toward another restart.
+                c.last_status = "warming"
+                _LOG.info("%s: still warming after restart (%.0fs left)",
+                          c.name, c.restart_grace_until - now)
+                continue
             c.consecutive_failures += 1
             c.last_status = f"down({c.consecutive_failures})"
             _LOG.warning(
@@ -403,6 +418,7 @@ class Supervisor:
                 await c.restart()
                 c.restart_count += 1
                 c.last_restart_at = time.time()
+                c.restart_grace_until = c.last_restart_at + c.restart_grace_s
                 c.consecutive_failures = 0
                 c.backoff_index += 1
                 _LOG.info("%s restart attempt %d done", c.name, c.restart_count)
@@ -464,8 +480,14 @@ async def _main_async(args) -> None:
     )
 
     components = [
-        Component(name=ha.name, check=ha.check, restart=ha.restart),
-        Component(name=brain.name, check=brain.check, restart=brain.restart),
+        Component(
+            name=ha.name, check=ha.check, restart=ha.restart,
+            restart_grace_s=60.0,  # HA serves /manifest.json ~30-60s after docker start
+        ),
+        Component(
+            name=brain.name, check=brain.check, restart=brain.restart,
+            restart_grace_s=10.0,  # brain_server prewarms claude + Kokoro at startup
+        ),
     ]
     supervisor = Supervisor(components)
 

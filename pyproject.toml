@@ -27,12 +27,34 @@ dependencies = [
     "aiohttp>=3.9",
     "requests>=2.31",
     "pyyaml>=6.0",
+    "aioesphomeapi>=24.0",
+    "numpy>=1.26",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
 voice = [
-    # Voice / TTS / Wyoming dependencies
+    # Voice / TTS / Wyoming dependencies. Brain server + supervisor
+    # bring these in; the deha_client lib does not.
     "wyoming>=1.5",
+    "kokoro-onnx>=0.4",
+    "onnxruntime>=1.18",
+]
+voice-gpu = [
+    # Substitute for `voice` when the host has CUDA. Pull this instead of
+    # `voice` to land Win #2 of the perf plan (Kokoro on the 3090).
+    # Notes:
+    # - onnxruntime-gpu 1.26 requires cuDNN 9.x and CUDA 12.x. The
+    #   nvidia-cudnn-cu12 package ships the cuDNN DLLs into
+    #   site-packages/nvidia/cudnn/bin/; deha.voice.kokoro_tts prepends
+    #   that to PATH at load time so onnxruntime can find them.
+    # - The CUDA toolkit itself (nvcc, driver) is NOT a pip dep — it
+    #   must be installed system-wide. Driver >=525 + CUDA 12.x is
+    #   required.
+    "wyoming>=1.5",
+    "kokoro-onnx>=0.4",
+    "onnxruntime-gpu>=1.18",
+    "nvidia-cudnn-cu12>=9.0,<10",
 ]
 dev = [
     "pytest>=8.0",
