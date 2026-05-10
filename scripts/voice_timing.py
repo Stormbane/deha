@@ -141,7 +141,8 @@ _HA_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # Supervisor markers (matched on the trailing portion after the prefix).
 _SUP_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("converse_in",        re.compile(r"\[converse\] cid=\S+ user=(.+)$")),
-    ("converse_out",       re.compile(r"\[converse\] cid=\S+ reply=.+continue=\S+\s+\((\d+) ms\)\s*$")),
+    # Optional ttft=Xms field added between continue and the parens.
+    ("converse_out",       re.compile(r"\[converse\] cid=\S+ reply=.+continue=\S+\s+(?:ttft=\d+ms\s+)?\((\d+) ms\)\s*$")),
     ("synth_start",        re.compile(r"narada\.tts\.wyoming INFO synth voice=(\S+) text=")),
     ("synth_first_chunk",  re.compile(r"narada\.tts\.wyoming INFO first_chunk voice=(\S+)")),
     ("synth_done",         re.compile(r"narada\.tts\.wyoming INFO synth_done voice=(\S+) chunks=(\d+)")),
@@ -306,7 +307,19 @@ def format_trace(turn: list[Event]) -> str:
 
 
 def compute_metrics(turn: list[Event]) -> dict[str, str]:
-    """Pull out the headline numbers."""
+    """Pull out the headline numbers.
+
+    The HEADLINE is user-perceived first-audio latency: from when the
+    user stopped speaking (vad_end) to when the first audio chunk goes
+    on the wire (synth_first_chunk). Everything else is sub-stage
+    breakdown to localize the cost.
+
+    Common confusion to avoid: 'TTS first-chunk after synth' looks
+    fast (~500ms on CPU Kokoro), but if HA is BATCHING the conversation
+    deltas before invoking TTS, that 500ms only starts AFTER the full
+    claude reply is generated. End-to-end is the only honest metric
+    for what the user actually hears.
+    """
     by_kind: dict[str, datetime] = {}
     for ev in turn:
         by_kind.setdefault(ev.kind, ev.t)  # first occurrence
@@ -317,13 +330,24 @@ def compute_metrics(turn: list[Event]) -> dict[str, str]:
         return "(missing)"
 
     return {
-        "STT (vad_end -> stt_result)":     diff("vad_end", "stt_result"),
-        "Conversation (claude)":           diff("converse_in", "converse_out"),
-        "TTS first-audio (synth -> chunk)": diff("synth_start", "synth_first_chunk"),
-        "TTS total (synth -> done)":       diff("synth_start", "synth_done"),
-        "End-to-end (vad_end -> synth_first_chunk)": diff("vad_end", "synth_first_chunk"),
-        "First-audio from utterance start (vad_start -> synth_first_chunk)":
-            diff("vad_start", "synth_first_chunk"),
+        # ---- HEADLINE ----
+        "*** USER-PERCEIVED first audio (vad_end -> first_chunk)":
+            diff("vad_end", "synth_first_chunk"),
+        # ---- sub-stage breakdown ----
+        "  STT (vad_end -> stt_result)":      diff("vad_end", "stt_result"),
+        "  Conversation (claude)":            diff("converse_in", "converse_out"),
+        "  HA buffer-then-TTS (converse_out -> synth_start)":
+            diff("converse_out", "synth_start"),
+        "  TTS engine first-chunk (synth_start -> synth_first_chunk)":
+            diff("synth_start", "synth_first_chunk"),
+        "  TTS total (synth_start -> synth_done)":
+            diff("synth_start", "synth_done"),
+        # If HA is dispatching TTS per-sentence (true streaming), the
+        # 'HA buffer-then-TTS' row above is small (tens of ms); if HA is
+        # waiting for the full conversation reply before invoking TTS
+        # (no streaming TTS), that row equals the conversation latency
+        # and the headline reflects it. That row is the diagnostic for
+        # whether streaming TTS is actually live.
     }
 
 

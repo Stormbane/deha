@@ -155,7 +155,12 @@ class NaradaConversationEntity(ConversationEntity):
                 continue_conversation=False,
             )
 
-        response.async_set_speech(full_text)
+        # Streaming path: chat_log already carried deltas to HA's TTS via
+        # SynthesizeStart/Chunk/Stop. Setting speech here causes HA's wyoming
+        # integration to ALSO dispatch a legacy Synthesize on the same
+        # connection — every sentence then plays twice. Leave speech empty
+        # so HA doesn't fire the legacy path.
+        response.async_set_speech("")
         return ConversationResult(
             response=response,
             conversation_id=cid,
