@@ -58,3 +58,15 @@ htmlcov/
 # Type checkers
 .mypy_cache/
 .ruff_cache/
+
+# Added by smriti setup
+.claude/
+
+# Large model files — fetched separately, not source
+models/
+
+# Generated audio artifacts (voice blend auditions, scratch WAVs)
+data/
+
+# pip install artifacts
+*.egg-info/
