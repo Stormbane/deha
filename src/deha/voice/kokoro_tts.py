@@ -99,6 +99,56 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'(])")
 _CLAUSE_SOFT_RE = re.compile(r"(?<=[,;:])\s+")
 _MAX_CHUNK_CHARS = 240
 
+# Inline speed control. Narada can prefix a sentence with one of these
+# tags; the tag is stripped before synthesis and sets the speed for that
+# sentence and all subsequent sentences until another tag (sticky).
+#   <slow>     -> 0.85
+#   <normal>   -> 1.0
+#   <fast>     -> 1.15
+#   <speed=N>  -> N, clamped to [_SPEED_MIN, _SPEED_MAX]
+# Closing forms (</slow>, </fast>, </normal>, </speed>) also recognized
+# and treated as "return to normal" (1.0). Narada emits these out of
+# SSML/XML habit even though our scoping is sticky-by-default.
+_NAMED_SPEEDS = {"slow": 0.85, "normal": 1.0, "fast": 1.15}
+_SPEED_TAG_RE = re.compile(r"<(/?)(slow|normal|fast|speed(?:=\d+(?:\.\d+)?)?)>")
+_SPEED_MIN, _SPEED_MAX = 0.5, 2.0
+
+
+def _consume_speed_tags(text: str, current: float) -> tuple[str, float]:
+    """Strip speed tags from `text`, return (cleaned_text, new_speed).
+
+    Multiple tags in one chunk: last-write-wins (later tag overrides
+    earlier). `current` is the sticky speed coming in; if no tag is
+    present the returned speed equals `current`.
+
+    Closing tags (</slow>, </fast>, etc.) reset to 1.0 regardless of
+    which scope they close — our model is "any close = back to normal".
+    """
+    new_speed = current
+    matches = list(_SPEED_TAG_RE.finditer(text))
+    if not matches:
+        return text, current
+    for m in matches:
+        is_closing = m.group(1) == "/"
+        token = m.group(2)
+        if is_closing:
+            new_speed = 1.0
+        elif token in _NAMED_SPEEDS:
+            new_speed = _NAMED_SPEEDS[token]
+        elif token.startswith("speed="):
+            try:
+                new_speed = float(token.split("=", 1)[1])
+            except ValueError:
+                continue
+        else:
+            # Bare "speed" (no =N) on open form — ignore silently.
+            continue
+        new_speed = max(_SPEED_MIN, min(_SPEED_MAX, new_speed))
+    cleaned = _SPEED_TAG_RE.sub("", text)
+    # Collapse double spaces left behind by stripped tags.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned, new_speed
+
 
 def _segment(text: str) -> list[str]:
     """Split text into TTS-friendly chunks.
@@ -323,15 +373,20 @@ class KokoroTTS:
             )
             _LOG.info("kokoro voice ready: %s", recipe)
 
-    async def synth_chunk(self, text: str) -> bytes:
-        """Synthesize a single chunk, return 16-bit PCM bytes."""
+    async def synth_chunk(self, text: str, speed: float | None = None) -> bytes:
+        """Synthesize a single chunk, return 16-bit PCM bytes.
+
+        speed=None falls back to the instance default (self._speed). Pass
+        an explicit value for per-utterance prosody control.
+        """
         await self._ensure_loaded()
+        effective_speed = self._speed if speed is None else speed
         async with self._synth_lock:
             samples, _sr = await asyncio.to_thread(
                 self._kokoro.create,
                 text,
                 voice=self._voice_array,
-                speed=self._speed,
+                speed=effective_speed,
                 lang=self._lang,
             )
         # kokoro-onnx returns float32 in [-1, 1].
@@ -365,9 +420,16 @@ class KokoroTTS:
         return True
 
     async def stream_text(self, text: str) -> AsyncIterator[bytes]:
-        """Synth a fixed string by chunks. Yields PCM bytes per chunk."""
+        """Synth a fixed string by chunks. Yields PCM bytes per chunk.
+
+        Inline speed tags (<slow>/<normal>/<fast>/<speed=N>) are honored
+        and apply sticky from where they appear.
+        """
+        current_speed = self._speed
         for chunk in _segment(text):
-            yield await self.synth_chunk(chunk)
+            cleaned, current_speed = _consume_speed_tags(chunk, current_speed)
+            if cleaned:
+                yield await self.synth_chunk(cleaned, speed=current_speed)
 
     async def stream_text_iter(
         self, text_chunks: Iterable[str]
@@ -376,9 +438,11 @@ class KokoroTTS:
 
         Buffers incoming deltas until a sentence/clause boundary is
         reached, then synthesizes that segment. Trailing buffer is
-        flushed when the iterator ends.
+        flushed when the iterator ends. Inline speed tags adjust pacing
+        sticky from where they appear.
         """
         buf = ""
+        current_speed = self._speed
         for delta in text_chunks:
             buf += delta
             # Greedy: emit complete sentences as soon as we see them.
@@ -387,8 +451,9 @@ class KokoroTTS:
                 if m is None:
                     break
                 head, buf = buf[: m.end()].strip(), buf[m.end():]
-                if head:
-                    yield await self.synth_chunk(head)
+                cleaned, current_speed = _consume_speed_tags(head, current_speed)
+                if cleaned:
+                    yield await self.synth_chunk(cleaned, speed=current_speed)
             # Soft-flush long pending clauses so first audio isn't gated
             # on a far-away period.
             if len(buf) > _MAX_CHUNK_CHARS:
@@ -396,17 +461,21 @@ class KokoroTTS:
                 if m:
                     cut = m[-1].end()
                     head, buf = buf[:cut].strip(), buf[cut:]
-                    if head:
-                        yield await self.synth_chunk(head)
+                    cleaned, current_speed = _consume_speed_tags(head, current_speed)
+                    if cleaned:
+                        yield await self.synth_chunk(cleaned, speed=current_speed)
         tail = buf.strip()
         if tail:
-            yield await self.synth_chunk(tail)
+            cleaned, current_speed = _consume_speed_tags(tail, current_speed)
+            if cleaned:
+                yield await self.synth_chunk(cleaned, speed=current_speed)
 
     async def stream_async_text_iter(
         self, text_aiter: AsyncIterator[str]
     ) -> AsyncIterator[bytes]:
         """Async-iterator twin of stream_text_iter — for live claude_stream."""
         buf = ""
+        current_speed = self._speed
         async for delta in text_aiter:
             buf += delta
             while True:
@@ -414,18 +483,22 @@ class KokoroTTS:
                 if m is None:
                     break
                 head, buf = buf[: m.end()].strip(), buf[m.end():]
-                if head:
-                    yield await self.synth_chunk(head)
+                cleaned, current_speed = _consume_speed_tags(head, current_speed)
+                if cleaned:
+                    yield await self.synth_chunk(cleaned, speed=current_speed)
             if len(buf) > _MAX_CHUNK_CHARS:
                 m = list(_CLAUSE_SOFT_RE.finditer(buf))
                 if m:
                     cut = m[-1].end()
                     head, buf = buf[:cut].strip(), buf[cut:]
-                    if head:
-                        yield await self.synth_chunk(head)
+                    cleaned, current_speed = _consume_speed_tags(head, current_speed)
+                    if cleaned:
+                        yield await self.synth_chunk(cleaned, speed=current_speed)
         tail = buf.strip()
         if tail:
-            yield await self.synth_chunk(tail)
+            cleaned, current_speed = _consume_speed_tags(tail, current_speed)
+            if cleaned:
+                yield await self.synth_chunk(cleaned, speed=current_speed)
 
 
 __all__ = ["KokoroTTS"]

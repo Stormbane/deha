@@ -572,7 +572,7 @@ def main() -> None:
     parser.add_argument("--python", default="", help="Python interpreter to use for brain_server")
     parser.add_argument("--prompt-file", default="", help="Override system prompt path")
     parser.add_argument("--voice", default="bm_george")
-    parser.add_argument("--model", default="sonnet")
+    parser.add_argument("--model", default="haiku")
     args = parser.parse_args()
 
     _setup_logging()

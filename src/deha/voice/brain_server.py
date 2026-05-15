@@ -321,54 +321,34 @@ def _default_prompt_path() -> Path:
 
 
 async def _prewarm_kokoro(tts: KokoroTTS) -> None:
-    """Force model load + a tiny synth so the first user-facing TTS is hot."""
+    """Force model load + a realistic synth so the first user-facing TTS is hot.
+
+    The prewarm string is intentionally a full sentence with varied
+    phonemes and punctuation — a single short word like "ready" leaves
+    most ONNX input shapes uncached, so the first real reply still pays
+    JIT cost. ~30 chars covers the common shape space at this voice.
+    """
     t0 = time.monotonic()
     try:
-        await tts.synth_chunk("ready")
+        await tts.synth_chunk("Ready when you are, traveler.")
         dt_ms = int((time.monotonic() - t0) * 1000)
         print(f"[prewarm] Kokoro ready ({dt_ms} ms)", flush=True)
     except Exception as e:
         print(f"[prewarm] Kokoro FAILED: {e}", flush=True)
 
 
-# Claude keepalive: Anthropic's prompt cache has a 5-minute default TTL.
-# After a long idle, the next user turn pays full prompt re-processing
-# cost — empirically ~5-10 s on the system prompt + accumulated
-# conversation history. A small probe every 4 minutes keeps the cache
-# warm. Cost: ~250 ms per probe (warm-path round trip), one extra
-# user/assistant pair appended to the conversation history per probe.
-# Pollution is acceptable for short-window voice sessions; if it starts
-# pushing context limits, we'll add periodic compaction.
-CLAUDE_KEEPALIVE_INTERVAL_S = 240.0
-CLAUDE_KEEPALIVE_PROBE = "ping"
-
-
-async def _claude_keepalive(pool: "StreamPool") -> None:
-    """Periodic small probe to keep Anthropic's prompt cache warm."""
-    while True:
-        try:
-            await asyncio.sleep(CLAUDE_KEEPALIVE_INTERVAL_S)
-            t0 = time.monotonic()
-            session = await pool.get("__keepalive__")
-            try:
-                # Use stream() so we can capture TTFT.
-                ttft_ms: int | None = None
-                async for _ in session.stream(CLAUDE_KEEPALIVE_PROBE):
-                    if ttft_ms is None:
-                        ttft_ms = int((time.monotonic() - t0) * 1000)
-                dt_ms = int((time.monotonic() - t0) * 1000)
-                # Always log keepalive: this is the canary for cache health.
-                print(
-                    f"[claude-keepalive] ttft={ttft_ms}ms total={dt_ms}ms",
-                    flush=True,
-                )
-            except Exception as e:
-                print(f"[claude-keepalive] probe failed: {e}", flush=True)
-                # Don't tear the session down — handle_converse will if needed.
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            print(f"[claude-keepalive] loop error: {e}", flush=True)
+async def _prewarm_claude(pool: "StreamPool") -> None:
+    """Send one tiny probe through the claude session so the first real
+    user turn doesn't pay the prompt-cache cold-miss (~5-7s)."""
+    t0 = time.monotonic()
+    try:
+        session = await pool.get("__prewarm__")
+        async for _ in session.stream("ping"):
+            pass
+        dt_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[prewarm] claude session warmed ({dt_ms} ms)", flush=True)
+    except Exception as e:
+        print(f"[prewarm] claude session warmup FAILED: {e}", flush=True)
 
 
 async def _serve_forever(
@@ -385,14 +365,16 @@ async def _serve_forever(
     site = web.TCPSite(runner, host=host, port=port)
     await site.start()
     print(f"narada brain HTTP on http://{host}:{port}", flush=True)
-    # Prewarm Kokoro in parallel with HTTP serving startup. The
-    # StreamPool prewarms its claude-cli session via app["pool"].start()
-    # in _on_startup; this covers the TTS half. Both pay their cold
-    # starts before the first user turn lands.
+    # Prewarm in parallel with HTTP serving startup so the first user
+    # turn lands on a fully hot pipeline. Three layers:
+    #   1. StreamPool spawns the claude-cli subprocess via _on_startup
+    #      (subprocess cold-start ~3-4s)
+    #   2. _prewarm_claude sends a tiny probe through it so the
+    #      prompt-cache cold-miss is paid here, not on first user turn
+    #   3. _prewarm_kokoro synths a realistic sentence so ORT input
+    #      shapes are JIT'd
     asyncio.create_task(_prewarm_kokoro(tts))
-    # Periodic small claude probe to keep Anthropic's prompt cache warm
-    # across long idle periods. See _claude_keepalive comments.
-    asyncio.create_task(_claude_keepalive(app["pool"]))
+    asyncio.create_task(_prewarm_claude(app["pool"]))
     # Start the utter mediator: drains the utterance queue, synthesizes
     # via Kokoro, plays via BOX-3 media_player. Independent of the HA
     # conversation TTS path.
