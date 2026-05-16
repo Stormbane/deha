@@ -96,6 +96,14 @@ MCP tools), MCP is the right shape.
 
 Two paths to the same handler. No duplication of business logic.
 
+## How prana wires body MCP into heartbeat and chat-bridge
+
+See `docs/plans/deha-narrowing-2026-05-16.md` §"prana-side wiring" for
+the concrete `--mcp-config` pattern, the per-process config layout
+(`~/.narada/heartbeat/mcp-config.json` vs. global `~/.claude.json`),
+and how this evolves once prana's session service (voice-roadmap §3)
+takes over the `claude -p` subprocess lifecycle.
+
 ## Implementation pointer
 
 - `deha/src/deha/mcp/server.py` — MCP protocol implementation
