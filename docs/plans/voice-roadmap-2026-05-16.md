@@ -1,13 +1,38 @@
 # deha — Voice & Body Roadmap
 
 **Date:** 2026-05-16
-**Status:** plan, not yet implemented
+**Status:** Tier 1 done; Tier 2 next.
 
-## Where we are
+## Status as of 2026-05-16
 
-Streaming TTS works end-to-end. Speed tags parse on the supervisor
-side. Voice has been usable for several days. Open items from last
-session and new priorities from Suti below, ordered easiest → hardest.
+**Tier 1 — DONE.** Commits `22bee72` + `729ce9d`:
+- Closing-tag bug fixed (speed tags incl. `</fast>` form get stripped).
+- Realistic Kokoro prewarm + new `_prewarm_claude` probe at startup
+  so first user turn doesn't pay the prompt-cache cold-miss.
+- Haiku default model in supervisor; keepalive removed.
+- Tag-strip pushed into `synth_chunk` so `/utter` and MCP callers
+  inherit consistent behavior.
+
+**Tier 2 — NEXT.** Suggested entry: 2.2 Presence v1 (no decision
+needed; the hardware turns out to be richer than first assumed —
+see correction below).
+
+**Tier 3** is the big design piece (voice ↔ Signal parity in prana);
+worth its own plan doc when Tier 2 is in flight.
+
+## Important correction (2026-05-16 close)
+
+I had been assuming the BOX-3 was sensor-light. Wrong — it's the
+**ESP32-S3-BOX-3-Sensor** variant, which has:
+
+- **mmWave radar** (proper human-in-room detection, even still)
+- **Camera**
+- **IR emitter/receiver**
+- **Temperature + humidity sensor**
+
+This changes Tier 2.2 (presence v1) from "microphone-only fallback"
+to "proper multi-sensor fusion as the `/presence` contract intended."
+See Tier 2.2 below for revised plan.
 
 ---
 
@@ -77,25 +102,56 @@ there.
 `docs/contracts/presence.md` defines the endpoint. prana already polls
 it with graceful fallback. Just needs implementation.
 
-**v1 — microphone-only:**
-- brain_server tracks `_last_vad_ts` updated whenever wyoming TTS
-  receives a SynthesizeStart event from HA (proxy: HA only dispatches
-  TTS when STT has produced a result, which means somebody just
-  spoke). Lossier but free.
-- Better: tap the wyoming STT side. HA's microVAD events flow through
-  the Wyoming protocol; we could host a tiny STT relay that mirrors
-  the events to `_last_vad_ts`. Heavier — defer to v2.
-- `/presence` returns `present=True` if `_last_vad_ts` within last 60s,
-  else False. `sources.microphone.confidence = 1.0` when present, else
-  decays linearly over the 60s window.
+The BOX-3-Sensor variant ships with mmWave radar, camera, IR
+emitter/receiver, and temp/humidity. Hardware is present; the question
+is what's currently enabled in the ESPHome firmware vs. what we need
+to add.
 
-**v2 (later, separate work):**
-- Add radar via HLK-LD2410 over UART → new ESPHome sensor →
-  HA → brain_server polling.
-- Optional: camera presence (only if Suti opts in for that sensor).
+**Step 0 — audit firmware.**
 
-**Files:** new `src/deha/voice/presence.py`, new route in
-`brain_server.py`.
+Before any deha-side code, open `firmware/*.yaml` and inventory:
+- Which radar component? (likely LD2410 — ESPHome has stock support.)
+- Is the camera block enabled? (`esp32_camera:` — disabled by default
+  in many BOX-3-Sensor builds.)
+- Are IR / temp / humidity exposed as sensors?
+- What HA entities does the firmware currently publish?
+
+If sensors aren't published to HA yet → first piece of work is the
+firmware YAML + reflash + verify entities appear in HA.
+
+**Step 1 — implement `/presence` reading the published sensors.**
+
+Priority order for fusion (best signal first):
+1. **mmWave radar** — best for "human in room, even still." Reports
+   `detected: bool` directly. Confidence is binary (present / not).
+2. **Microphone VAD** — almost free; tap the wyoming STT events as
+   they pass through brain_server. `last_voice_ts` decays over 60s.
+3. **Camera** — heaviest. Privacy call needed before exposing raw
+   frames; binary "person detected" via on-device inference is the
+   right interface. Defer the implementation detail to v1.5 if it
+   delays the rest.
+4. **Temp/humidity** — not presence per se, but expose alongside as
+   environmental context (useful for other Narada decisions).
+
+Fusion rule for `present` field: True if radar says yes OR (camera
+says yes) OR (mic vad within last N seconds). Per-sensor confidences
+surfaced individually in `sources.*` for prana to do its own logic
+later.
+
+**Step 2 — verify prana sees it.**
+
+prana already polls with graceful fallback (per the `/presence`
+commit message). When deha starts returning real data, prana's
+router behavior should change automatically — no prana-side code
+change needed. Confirm via prana's logs.
+
+**Files:** `firmware/*.yaml` (sensor enablement), new
+`src/deha/voice/presence.py`, new route in `brain_server.py`,
+likely also a small HA-state reader (or use existing `deha_client`
+patterns to read entity state).
+
+**Out of scope for v1:** camera-based gaze detection, fine-grained
+zones, multi-person counts. Just binary "human present in the room."
 
 ### 2.3 Wake word — "Narada"
 
