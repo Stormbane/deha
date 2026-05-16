@@ -67,6 +67,10 @@ class ClaudeStreamSession:
             "--disallowedTools", _DISALLOWED_TOOLS,
         ]
         loop = asyncio.get_running_loop()
+        # Detach from any inherited console so Windows doesn't allocate a
+        # fresh conhost for the claude.exe child — important when this
+        # runs under a console-less brain_server (CREATE_NO_WINDOW).
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self._proc = await asyncio.to_thread(
             subprocess.Popen,
             cmd,
@@ -75,6 +79,7 @@ class ClaudeStreamSession:
             stderr=subprocess.PIPE,
             bufsize=0,
             cwd=tempfile.gettempdir(),
+            creationflags=creationflags,
         )
         self._reader_thread = threading.Thread(
             target=self._stdout_loop, args=(loop,), daemon=True,

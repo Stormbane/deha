@@ -243,11 +243,19 @@ class BrainServerProcess:
             if self._prompt_file is not None:
                 cmd += ["--prompt-file", str(self._prompt_file)]
             _LOG.info("spawning brain_server: %s", " ".join(cmd))
+            # On Windows, the supervisor runs under pythonw.exe (no console).
+            # Spawning console-subsystem python.exe without CREATE_NO_WINDOW
+            # makes Windows allocate a fresh conhost — that popup is the
+            # brain_server's console, and closing it (or any stray Ctrl+Break
+            # delivered to it) kills brain_server with STATUS_CONTROL_C_EXIT
+            # (0xC000013A / rc=3221225786). Detach from any console.
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(_project_root()),
+                creationflags=creationflags,
             )
             asyncio.create_task(self._tail_stdout())
 
