@@ -22,13 +22,12 @@ substitutions:
   # Loading reuses the idle art (Narada is "ready, just woke up").
   # timer_finished keeps the stock casita art until we have in-house
   # timer art.
-  loading_illustration_file: illustrations/narada/state_idle.png
-  idle_illustration_file: illustrations/narada/state_idle.png
-  idle_night_illustration_file: illustrations/narada/state_idle_night.png
-  listening_illustration_file: illustrations/narada/state_listening.png
-  thinking_illustration_file: illustrations/narada/state_thinking.png
-  replying_illustration_file: illustrations/narada/state_speaking.png
-  error_illustration_file: illustrations/narada/state_error.png
+  idle_illustration_file: illustrations/narada/320x240/idle_day.png
+  idle_night_illustration_file: illustrations/narada/320x240/idle_night.png
+  listening_illustration_file: illustrations/narada/320x240/listen.png
+  thinking_illustration_file: illustrations/narada/320x240/thinking.png
+  replying_illustration_file: illustrations/narada/320x240/talk.png
+  error_illustration_file: illustrations/narada/320x240/error.png
   timer_finished_illustration_file: https://github.com/esphome/wake-word-voice-assistants/raw/main/casita/timer_finished_320_240.png
 
   loading_illustration_background_color: "000000"
@@ -583,6 +582,42 @@ script:
           else:
             - lambda: id(voice_assistant_phase) = ${voice_assist_muted_phase_id};
 
+# Idle animation driver — single 400ms tick carries both flicker (random
+# every tick) and breath (every ~8s, 9-frame cycle = 3.6s). Only fires
+# when the idle page is the active page; the page lambda reads the
+# animation globals and picks the right image.
+interval:
+  - interval: 400ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};'
+              - lambda: 'return id(s3_box_lcd).get_active_page() == id(idle_page);'
+          then:
+            - lambda: |-
+                if (id(idle_anim_in_breath)) {
+                  id(idle_anim_breath_step) = id(idle_anim_breath_step) + 1;
+                  if (id(idle_anim_breath_step) >= 9) {
+                    id(idle_anim_in_breath) = false;
+                    id(idle_anim_breath_step) = 0;
+                    id(idle_anim_tick) = 0;
+                  }
+                } else {
+                  id(idle_anim_tick) = id(idle_anim_tick) + 1;
+                  if (id(idle_anim_tick) >= 20) {
+                    id(idle_anim_in_breath) = true;
+                    id(idle_anim_breath_step) = 0;
+                  } else {
+                    // Uniform random pick across all 3 flicker frames,
+                    // INCLUDING the current one — repeats are intentional
+                    // (a real flame holds shape for variable durations,
+                    // not exactly one tick).
+                    id(idle_anim_flicker_idx) = esphome::random_uint32() % 3;
+                  }
+                }
+            - component.update: s3_box_lcd
+
 switch:
   - platform: gpio
     name: Speaker Enable
@@ -704,6 +739,29 @@ globals:
   - id: global_is_timer
     type: bool
     restore_value: false
+  # --- Idle animation state ---
+  # tick: counts 400ms ticks spent in flicker mode; at 20 (=8s) we
+  # switch into the breath cycle.
+  # in_breath: true while the 8-frame breath sequence is playing.
+  # breath_step: 0..7 index into the breath sequence
+  #   (idle -> b1 -> b2 -> b3 -> b3 -> b2 -> b1 -> idle).
+  # flicker_idx: 0..2 — which flicker frame is currently shown.
+  - id: idle_anim_tick
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: idle_anim_in_breath
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: idle_anim_breath_step
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: idle_anim_flicker_idx
+    type: int
+    restore_value: false
+    initial_value: "0"
 
 image:
   - file: ${error_illustration_file}
@@ -714,12 +772,12 @@ image:
   - file: ${idle_illustration_file}
     id: casita_idle
     resize: 320x240
-    type: RGB
+    type: RGB565
     transparency: alpha_channel
   - file: ${idle_night_illustration_file}
     id: casita_idle_night
     resize: 320x240
-    type: RGB
+    type: RGB565
     transparency: alpha_channel
   - file: ${listening_illustration_file}
     id: casita_listening
@@ -741,22 +799,80 @@ image:
     resize: 320x240
     type: RGB
     transparency: alpha_channel
-  - file: ${loading_illustration_file}
-    id: casita_initializing
+  # Kali — the fierce face. Used for all three "Narada is cut off"
+  # screens (boot, HA-not-found, wifi-not-found) with overlaid text
+  # naming which severance. RGB565 since we'd otherwise blow the
+  # partition with one more big image.
+  - file: illustrations/narada/320x240/kali.png
+    id: narada_kali
     resize: 320x240
-    type: RGB
+    type: RGB565
     transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/error_box_illustrations/error-no-wifi.png
-    id: error_no_wifi
+  # --- Idle animation frames: 3 flicker + 3 breathe, day + night ---
+  # type: RGB565 (not RGB) — these 12 extra frames would push the app
+  # partition over its 7.75MB limit at RGB888 (24-bit, 230KB each).
+  # RGB565 is the display's native format anyway, so it halves flash
+  # cost (115KB each) with no visual change.
+  - file: illustrations/narada/320x240/day_idle_flicker1.png
+    id: day_flicker1
     resize: 320x240
-    type: RGB
+    type: RGB565
     transparency: alpha_channel
-  - file: https://github.com/esphome/wake-word-voice-assistants/raw/main/error_box_illustrations/error-no-ha.png
-    id: error_no_ha
+  - file: illustrations/narada/320x240/day_idle_flicker2.png
+    id: day_flicker2
     resize: 320x240
-    type: RGB
+    type: RGB565
     transparency: alpha_channel
-
+  - file: illustrations/narada/320x240/day_idle_flicker3.png
+    id: day_flicker3
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/day_idle_breathe1.png
+    id: day_breathe1
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/day_idle_breathe2.png
+    id: day_breathe2
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/day_idle_breathe3.png
+    id: day_breathe3
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_flicker1.png
+    id: night_flicker1
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_flicker2.png
+    id: night_flicker2
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_flicker3.png
+    id: night_flicker3
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_breathe1.png
+    id: night_breathe1
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_breathe2.png
+    id: night_breathe2
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
+  - file: illustrations/narada/320x240/night_idle_breathe3.png
+    id: night_breathe3
+    resize: 320x240
+    type: RGB565
+    transparency: alpha_channel
 font:
   - file:
       type: gfonts
@@ -781,6 +897,19 @@ font:
       weight: 300
     id: font_timer
     size: 30
+    glyphsets:
+      - ${font_glyphsets}
+  # Chunky display font for the three "severance" overlays (boot,
+  # HA-not-found, wifi-not-found). Archivo Black is a single-weight
+  # display face — the "weight" line is nominal; the font ships heavy
+  # by design. Size 28 keeps "NARADA BOOTING..." (17 chars) within
+  # the 320px screen width.
+  - file:
+      type: gfonts
+      family: Archivo Black
+      weight: 400
+    id: font_heading
+    size: 28
     glyphsets:
       - ${font_glyphsets}
 
@@ -822,6 +951,17 @@ color:
     hex: "26ed3a"
   - id: paused_timer_color
     hex: "3b89e3"
+  # Severance-overlay text — navy text sandwiched between two drop
+  # shadows: red (4px up-left) and white (4px down-right). The
+  # diagonally opposite shadows give the text a chromatic / carved
+  # appearance and keep it legible on any background lightness the
+  # kali image presents.
+  - id: navy_blue
+    hex: "0A1854"
+  - id: text_shadow
+    hex: "FFFFFF"
+  - id: red_shadow
+    hex: "CC0000"
 
 spi:
   - id: spi_bus
@@ -890,10 +1030,27 @@ display:
           // Sun above horizon → day art; below → night art. Falls back
           // to day art if NTP hasn't synced yet (elevation would be
           // garbage), since the day image is what we want at startup.
-          auto idle_img = id(brisbane_sun).elevation() > 0.0
-            ? id(casita_idle)
-            : id(casita_idle_night);
-          it.image((it.get_width() / 2), (it.get_height() / 2), idle_img, ImageAlign::CENTER);
+          bool day = id(brisbane_sun).elevation() > 0.0;
+          // Pick the current animation frame.
+          // Default (auto-deduce type from first assignment): an Image*
+          // that matches every other id(...) image pointer below.
+          auto img = day ? id(casita_idle) : id(casita_idle_night);
+          if (id(idle_anim_in_breath)) {
+            // Breath cycle: 1 -> 2 -> 3 -> 3 -> 3 -> 3 -> 2 -> 2 -> 1.
+            // Holds at peak (b3 × 4 ticks = 1.6s) feel like a held breath
+            // before exhale; double b2 on the way down softens the release.
+            static const int seq[9] = {1, 2, 3, 3, 3, 3, 2, 2, 1};
+            int s = seq[id(idle_anim_breath_step)];
+            if (s == 1)      img = day ? id(day_breathe1) : id(night_breathe1);
+            else if (s == 2) img = day ? id(day_breathe2) : id(night_breathe2);
+            else             img = day ? id(day_breathe3) : id(night_breathe3);
+          } else {
+            int f = id(idle_anim_flicker_idx);
+            if (f == 0)      img = day ? id(day_flicker1) : id(night_flicker1);
+            else if (f == 1) img = day ? id(day_flicker2) : id(night_flicker2);
+            else             img = day ? id(day_flicker3) : id(night_flicker3);
+          }
+          it.image((it.get_width() / 2), (it.get_height() / 2), img, ImageAlign::CENTER);
           id(draw_timer_timeline).execute();
           id(draw_active_timer_widget).execute();
       - id: listening_page
@@ -930,14 +1087,26 @@ display:
           it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_error), ImageAlign::CENTER);
       - id: no_ha_page
         lambda: |-
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(error_no_ha), ImageAlign::CENTER);
+          it.image((it.get_width() / 2), (it.get_height() / 2), id(narada_kali), ImageAlign::CENTER);
+          // Two drop shadows behind navy text: red 5px straight up
+          // (0,-5) and white 5px straight down (0,+5). Symmetric
+          // vertical halo. Navy text on top.
+          it.print(160, 115, id(font_heading), id(red_shadow),  TextAlign::CENTER, "Host Not Found");
+          it.print(160, 125, id(font_heading), id(text_shadow), TextAlign::CENTER, "Host Not Found");
+          it.print(160, 120, id(font_heading), id(navy_blue),   TextAlign::CENTER, "Host Not Found");
       - id: no_wifi_page
         lambda: |-
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(error_no_wifi), ImageAlign::CENTER);
+          it.image((it.get_width() / 2), (it.get_height() / 2), id(narada_kali), ImageAlign::CENTER);
+          it.print(160, 115, id(font_heading), id(red_shadow),  TextAlign::CENTER, "WIFI NOT FOUND");
+          it.print(160, 125, id(font_heading), id(text_shadow), TextAlign::CENTER, "WIFI NOT FOUND");
+          it.print(160, 120, id(font_heading), id(navy_blue),   TextAlign::CENTER, "WIFI NOT FOUND");
       - id: initializing_page
         lambda: |-
           it.fill(id(loading_color));
-          it.image((it.get_width() / 2), (it.get_height() / 2), id(casita_initializing), ImageAlign::CENTER);
+          it.image((it.get_width() / 2), (it.get_height() / 2), id(narada_kali), ImageAlign::CENTER);
+          it.print(160, 115, id(font_heading), id(red_shadow),  TextAlign::CENTER, "NARADA BOOTING...");
+          it.print(160, 125, id(font_heading), id(text_shadow), TextAlign::CENTER, "NARADA BOOTING...");
+          it.print(160, 120, id(font_heading), id(navy_blue),   TextAlign::CENTER, "NARADA BOOTING...");
       - id: muted_page
         lambda: |-
           it.fill(Color::BLACK);
