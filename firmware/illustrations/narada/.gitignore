@@ -1,0 +1,9 @@
+# Source Midjourney rolls and working images are kept locally for
+# iteration but not committed — they're ~40MB and the firmware only
+# consumes the canonical `state_*.png` files. If we settle on a roll
+# we want versioned long-term, copy it to a state_*.png name; that
+# pattern is the only one tracked.
+*
+!.gitignore
+!README.md
+!state_*.png

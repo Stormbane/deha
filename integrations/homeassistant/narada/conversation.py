@@ -155,12 +155,12 @@ class NaradaConversationEntity(ConversationEntity):
                 continue_conversation=False,
             )
 
-        # Streaming path: chat_log already carried deltas to HA's TTS via
-        # SynthesizeStart/Chunk/Stop. Setting speech here causes HA's wyoming
-        # integration to ALSO dispatch a legacy Synthesize on the same
-        # connection — every sentence then plays twice. Leave speech empty
-        # so HA doesn't fire the legacy path.
-        response.async_set_speech("")
+        # Set speech so HA's voice pipeline fires the tts-start event to
+        # the device (firmware uses it to switch to the speaking-state
+        # image). HA will also dispatch a legacy Synthesize to wyoming —
+        # the wyoming-side _streaming_active dedupe in wyoming_tts.py
+        # drops that to prevent each sentence playing twice.
+        response.async_set_speech(full_text)
         return ConversationResult(
             response=response,
             conversation_id=cid,
