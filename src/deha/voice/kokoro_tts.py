@@ -378,13 +378,23 @@ class KokoroTTS:
 
         speed=None falls back to the instance default (self._speed). Pass
         an explicit value for per-utterance prosody control.
+
+        Speed tags (<slow>/<normal>/<fast>/<speed=N> and closing forms)
+        are stripped here so every caller gets consistent behavior — not
+        just the streaming iterators. A tag inside `text` overrides the
+        explicit `speed` argument (last-write-wins). When called from
+        the streaming iterators (which have already consumed tags), the
+        strip is a no-op.
         """
         await self._ensure_loaded()
         effective_speed = self._speed if speed is None else speed
+        cleaned, effective_speed = _consume_speed_tags(text, effective_speed)
+        if not cleaned:
+            return b""
         async with self._synth_lock:
             samples, _sr = await asyncio.to_thread(
                 self._kokoro.create,
-                text,
+                cleaned,
                 voice=self._voice_array,
                 speed=effective_speed,
                 lang=self._lang,
