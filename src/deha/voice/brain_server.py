@@ -47,6 +47,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from ..sensors import presence
 from .claude_stream import ClaudeStreamSession
 from .kokoro_tts import KokoroTTS
 from .utter import UtteranceQueue, VoiceMediator
@@ -282,6 +283,13 @@ async def handle_health(request: web.Request) -> web.Response:
     })
 
 
+async def handle_presence(request: web.Request) -> web.Response:
+    # Cheap, no I/O today (all readers are stubs). Future readers may
+    # query aioesphomeapi — wrap them in asyncio.to_thread or make them
+    # async at that point.
+    return web.json_response(presence.current())
+
+
 async def _on_startup(app: web.Application) -> None:
     await app["pool"].start()
 
@@ -297,6 +305,7 @@ def make_app(system_prompt: str, model: str) -> web.Application:
     app.router.add_post("/converse", handle_converse)
     app.router.add_post("/utter", handle_utter)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/presence", handle_presence)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)
     return app
