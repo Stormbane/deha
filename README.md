@@ -1,5 +1,12 @@
 # deha
 
+> **ARCHIVED 2026-09-06.** Superseded by the LiveKit body stack:
+> firmware in `narada-box3` (native ESP-IDF, LiveKit room client),
+> voice worker / admission / alerting in `prana`. The ESPHome +
+> Home Assistant/Wyoming pipeline here is no longer flashed or run.
+> Kept as the BOX-3 pinout/codec reference and for the expression
+> vocabulary that was ported to `narada-box3`'s LVGL scenes.
+
 The body. ESP32-S3-BOX-3 firmware, voice brain server, expression engine,
 and the `deha_client` Python library other projects use to talk to the body.
 

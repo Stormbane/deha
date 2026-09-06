@@ -162,10 +162,16 @@ async def _tcp_ok(host: str, port: int) -> bool:
 async def _docker_container_running(name: str) -> bool:
     """`docker inspect` is the cheapest reliable check."""
     try:
+        # CREATE_NO_WINDOW: this runs on the 30s health-check cadence
+        # under a console-less pythonw supervisor; without the flag,
+        # every poll allocates a visible conhost. Same pattern as the
+        # brain_server spawn below.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = await asyncio.create_subprocess_exec(
             "docker", "inspect", "-f", "{{.State.Running}}", name,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=creationflags,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), HEALTH_CHECK_TIMEOUT_S)
         return proc.returncode == 0 and stdout.strip() == b"true"
@@ -186,10 +192,12 @@ class HAContainer:
 
     async def restart(self) -> None:
         _LOG.info("restarting HA container")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = await asyncio.create_subprocess_exec(
             "docker", "start", HA_CONTAINER_NAME,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=creationflags,
         )
         await proc.communicate()
         if proc.returncode != 0:

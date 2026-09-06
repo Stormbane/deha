@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -83,12 +84,19 @@ class ClaudeCodeBrain:
         # it without --bare, which requires API-key auth not subscription),
         # but its content is about smriti / memory tools, not HA voice
         # assist phrasing.
+        # CREATE_NO_WINDOW: under brain_server (spawned by supervisor as
+        # console-less pythonw), spawning console claude.exe without this
+        # flag allocates a fresh conhost — a visible console flash on
+        # every voice turn. Same pattern as the brain_server spawn in
+        # supervisor.py and the streaming claude in claude_stream.py.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=tempfile.gettempdir(),
+            creationflags=creationflags,
         )
         stdout, stderr = await proc.communicate(input=user_text.encode("utf-8"))
         if proc.returncode != 0:

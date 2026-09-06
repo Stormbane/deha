@@ -272,11 +272,18 @@ media_player:
 micro_wake_word:
   id: mww
   models:
-    # `okay_nabu` is the primary wake — eventually swap for `hey_narada`
-    # once we've trained a custom mWW model. We deliberately do NOT
-    # carry a 'stop' model here: mWW cannot run during TTS playback on
-    # the BOX-3 (i2s bus contention with the speaker), so the interrupt
-    # path goes through the GT911 touchscreen instead.
+    # Custom "Naahrowhdah" model trained 2026-05-18 (microWakeWord trainer,
+    # 50k+40k steps on RTX 3090). Calibrated metrics: recall 93.83%,
+    # false_accepts_per_hour 0.93. See firmware/wake_words/narada/README.md
+    # for tuning notes if FA rate or recall drift in practice.
+    #
+    # We deliberately do NOT carry a 'stop' model here: mWW cannot run
+    # during TTS playback on the BOX-3 (i2s bus contention with the
+    # speaker), so the interrupt path goes through the GT911 touchscreen.
+    - model: wake_words/narada/narada.json
+    # `okay_nabu` kept as a secondary trigger — ESPHome bundled model,
+    # well-trained baseline. Useful as a fallback while the custom
+    # model is tuned for noisy/TV environments.
     - okay_nabu
   on_wake_word_detected:
     - voice_assistant.start:
@@ -973,11 +980,20 @@ spi:
 # blocked; touch is independent of the i2s audio bus and fires
 # cleanly during TTS playback. INT on GPIO3, reset shared with the
 # display on GPIO48 (already driven by the display block — don't
-# declare it again here). One tap is contextual:
-#   idle      -> start a turn (same as 'okay nabu')
+# declare it again here).
+#
+# Phase-aware contextual tap (semantics confirmed with Suti 2026-05-20):
+#   idle      -> start a turn (same as the wake-word path)
 #   listening -> cancel listen, return to idle
-#   thinking  -> abort the turn
+#   thinking  -> NO-OP (don't perturb the pipeline mid-think)
 #   replying  -> cancel TTS, return to idle
+#   other     -> no-op (not_ready, muted, error, timer_finished)
+#
+# Branching on id(voice_assistant_phase) rather than
+# voice_assistant.is_running, which is true for listening AND
+# thinking AND replying — collapsing them into one bucket made
+# touch-during-listening fire voice_assistant.stop which HA returns
+# as an error (the "error state / black dog" Suti reported).
 touchscreen:
   - platform: gt911
     id: box_touch
@@ -989,12 +1005,39 @@ touchscreen:
       - logger.log:
           tag: narada
           level: INFO
-          format: "touch event"
+          format: "touch — phase=%d"
+          args: ['id(voice_assistant_phase)']
+      # idle → start a turn
       - if:
           condition:
-            or:
-              - voice_assistant.is_running:
-              - media_player.is_announcing:
+            lambda: 'return id(voice_assistant_phase) == ${voice_assist_idle_phase_id};'
+          then:
+            - voice_assistant.start:
+                wake_word: "touch"
+            # Optimistic local phase transition. HA's on_listening
+            # callback takes 100-500ms to arrive; without this,
+            # a rapid second tap meant to cancel still sees phase==idle
+            # and fires voice_assistant.start a second time instead of
+            # routing to the cancel branch. When on_listening eventually
+            # fires it sets phase to the same value — harmless no-op.
+            - lambda: id(voice_assistant_phase) = ${voice_assist_listening_phase_id};
+            - script.execute: draw_display
+      # listening → cancel listen, force back to idle
+      - if:
+          condition:
+            lambda: 'return id(voice_assistant_phase) == ${voice_assist_listening_phase_id};'
+          then:
+            # Best-effort signal to HA. Whisper STT cannot cancel mid-
+            # inference, so HA may complete the pipeline and emit a
+            # delayed STT result anyway — we drive the local UI back to
+            # idle so touch FEELS responsive regardless.
+            - voice_assistant.stop:
+            - script.execute: set_idle_or_mute_phase
+            - script.execute: draw_display
+      # replying → cancel TTS playback, force back to idle
+      - if:
+          condition:
+            lambda: 'return id(voice_assistant_phase) == ${voice_assist_replying_phase_id};'
           then:
             - if:
                 condition:
@@ -1007,9 +1050,9 @@ touchscreen:
                   voice_assistant.is_running:
                 then:
                   - voice_assistant.stop:
-          else:
-            - voice_assistant.start:
-                wake_word: "touch"
+            - script.execute: set_idle_or_mute_phase
+            - script.execute: draw_display
+      # thinking + other states → intentionally no-op
 
 display:
   - platform: mipi_spi
